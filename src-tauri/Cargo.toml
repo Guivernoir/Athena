@@ -1,0 +1,46 @@
+[package]
+name = "erikav01"
+version = "0.1.0"
+description = "A british/Russian agent"
+authors = ["Guilherme F. G. Santos"]
+license = "MIT"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "erikav01_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "^1.0"
+
+[dependencies]
+tauri = { version = "^2.5.0", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+url = "2.4"
+regex = "1.9"
+async-trait = "0.1"
+dotenv = "0.15"
+thiserror = "^1.0"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+cuda = ["cc/parallel"] 
+metal = []  
+static = []  
+
+[dev-dependencies]
+tempfile = "^3.0"

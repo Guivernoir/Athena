@@ -1,0 +1,33 @@
+@PACKAGE_INIT@
+
+# quantizerConfig.cmake - Package configuration file for quantizer library
+
+include(CMakeFindDependencyMacro)
+
+# Check for required dependencies
+# find_dependency(SomePackage REQUIRED) # Add if needed
+
+# Include the targets file
+include("${CMAKE_CURRENT_LIST_DIR}/quantizerTargets.cmake")
+
+# Define the main targets
+if(TARGET quantizer::quantizer)
+    set(quantizer_FOUND TRUE)
+    set(quantizer_LIBRARIES quantizer::quantizer)
+    set(quantizer_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/include")
+    
+    # For backwards compatibility
+    add_library(quantizer ALIAS quantizer::quantizer)
+    
+    # Export configuration information
+    get_target_property(quantizer_LOCATION quantizer::quantizer LOCATION)
+    get_target_property(quantizer_INTERFACE_INCLUDE_DIRECTORIES quantizer::quantizer INTERFACE_INCLUDE_DIRECTORIES)
+    
+    message(STATUS "Found quantizer: ${quantizer_LOCATION}")
+else()
+    set(quantizer_FOUND FALSE)
+    message(FATAL_ERROR "quantizer library not found")
+endif()
+
+# Check that the targets have been created
+check_required_components(quantizer)
