@@ -1,4 +1,3 @@
-// quantization/cpp/quantizer.cpp
 #include "quantizer.hpp"
 #include "kernels.hpp"
 #include <algorithm>

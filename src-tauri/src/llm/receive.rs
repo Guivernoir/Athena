@@ -1,16 +1,14 @@
 use std::env;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use reqwest::Client;
-use std::time::Duration;
+use std::sync::Arc;
+use crate::llama::{LLMEngine, GenerationConfig, ChatMessage, MessageRole, LLMError};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
-    pub model: String,
-    pub api_key: String,
-    pub api_url: String,
+    pub model_path: String,
     pub number_of_queries: i32,
     pub max_research_loops: u32,
+    pub generation_config: GenerationConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -52,30 +50,6 @@ pub struct ProcessedRequest {
     pub original_input: String,
     pub processed_input: String,
     pub config: Config,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct LLMRequest {
-    pub model: String,
-    pub messages: Vec<Message>,
-    pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct LLMResponse {
-    pub choices: Vec<Choice>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Choice {
-    pub message: Message,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -201,27 +175,37 @@ pub async fn load_config() -> Result<Config, String> {
 pub async fn load_config_from_env() -> Result<Config, String> {
     dotenv::dotenv().ok(); 
     
-    let model = env::var("MODEL")
-        .map_err(|_| "MODEL environment variable not set".to_string())?;
-    let api_key = env::var("API_KEY")
-        .map_err(|_| "API_KEY environment variable not set".to_string())?;
-    let api_url = env::var("API_URL")
-        .map_err(|_| "API_URL environment variable not set".to_string())?;
+    let model_path = env::var("MODEL_PATH")
+        .unwrap_or_else(|_| "llama/models/qwen2.5-0.5b-instruct-q5_k_m.gguf".to_string());
+    
     let number_of_queries = env::var("NUMBER_OF_QUERIES")
         .unwrap_or_else(|_| "5".to_string())
         .parse::<i32>()
         .map_err(|_| "Invalid NUMBER_OF_QUERIES format".to_string())?;
+    
     let max_research_loops = env::var("MAX_RESEARCH_LOOPS")
         .unwrap_or_else(|_| "3".to_string())
         .parse::<u32>()
         .map_err(|_| "Invalid MAX_RESEARCH_LOOPS format".to_string())?;
 
+    let max_tokens = env::var("MAX_TOKENS")
+        .unwrap_or_else(|_| "150".to_string())
+        .parse::<i32>()
+        .map_err(|_| "Invalid MAX_TOKENS format".to_string())?;
+
+    let temperature = env::var("TEMPERATURE")
+        .unwrap_or_else(|_| "0.1".to_string())
+        .parse::<f32>()
+        .map_err(|_| "Invalid TEMPERATURE format".to_string())?;
+
     Ok(Config {
-        model,
-        api_key,
-        api_url,
+        model_path,
         number_of_queries,
         max_research_loops,
+        generation_config: GenerationConfig {
+            max_tokens,
+            temperature,
+        },
     })
 }
 
@@ -246,12 +230,14 @@ pub async fn process_with_llm(
     config: &Config,
 ) -> Result<ParsedInput, String> {
     const MAX_RETRIES: u32 = 3;
-    const RETRY_DELAY_MS: u64 = 1000;
     
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    // Initialize the LLM engine - no more network calls, comrade
+    let engine = LLMEngine::new(&config.model_path)
+        .map_err(|e| format!("Failed to initialize LLM engine: {}", e))?;
+    
+    if !engine.is_loaded() {
+        return Err("LLM engine failed to load model".to_string());
+    }
     
     let system_prompt = format!(
         "You are an intelligent parsing assistant for a tutoring chatbot. Your task is to analyze user input and extract structured information.
@@ -275,26 +261,8 @@ Example output:
         proficiency.get_system_prompt()
     );
     
-    let messages = vec![
-        Message {
-            role: "system".to_string(),
-            content: system_prompt,
-        },
-        Message {
-            role: "user".to_string(),
-            content: input.to_string(),
-        },
-    ];
-    
-    let request_body = LLMRequest {
-        model: config.model.clone(),
-        messages,
-        max_tokens: Some(150), // Reduced since we only need JSON output
-        temperature: Some(0.1), // Lower temperature for more consistent parsing
-    };
-    
     for attempt in 1..=MAX_RETRIES {
-        match make_llm_request(&client, &config, &request_body).await {
+        match engine.simple_chat(input, Some(&system_prompt), Some(config.generation_config.clone())) {
             Ok(response_content) => {
                 match parse_llm_response(&response_content, input, mode, proficiency) {
                     Ok(parsed_input) => return Ok(parsed_input),
@@ -307,71 +275,20 @@ Example output:
                     }
                 }
             }
-            Err(request_error) => {
+            Err(llm_error) => {
                 if attempt == MAX_RETRIES {
-                    return Err(format!("All {} attempts failed. Last error: {}", MAX_RETRIES, request_error));
+                    return Err(format!("All {} attempts failed. Last error: {}", MAX_RETRIES, llm_error));
                 }
-                eprintln!("Request attempt {}/{} failed: {}", attempt, MAX_RETRIES, request_error);
+                eprintln!("LLM attempt {}/{} failed: {}", attempt, MAX_RETRIES, llm_error);
             }
         }
         
-        // Wait before retrying
-        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64)).await;
+        // Brief tactical pause before retry - even local models need a moment
+        tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt as u64)).await;
     }
     
     // This should never be reached due to the logic above, but just in case
     Err("Unexpected error in retry logic".to_string())
-}
-
-async fn make_llm_request(
-    client: &Client,
-    config: &Config,
-    request_body: &LLMRequest,
-) -> Result<String, String> {
-    let response = client
-        .post(&config.api_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(request_body)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "Request timeout - the API took too long to respond".to_string()
-            } else if e.is_connect() {
-                "Connection error - unable to reach the API".to_string()
-            } else {
-                format!("Network error: {}", e)
-            }
-        })?;
-    
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(match status.as_u16() {
-            401 => "Authentication failed - check your API key".to_string(),
-            403 => "Access forbidden - insufficient permissions".to_string(),
-            429 => "Rate limit exceeded - too many requests".to_string(),
-            500..=599 => format!("Server error ({}): {}", status, error_text),
-            _ => format!("HTTP error {}: {}", status, error_text),
-        });
-    }
-    
-    let llm_response: LLMResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse API response as JSON: {}", e))?;
-    
-    if llm_response.choices.is_empty() {
-        return Err("API returned empty response".to_string());
-    }
-    
-    let content = &llm_response.choices[0].message.content;
-    if content.trim().is_empty() {
-        return Err("API returned empty content".to_string());
-    }
-    
-    Ok(content.clone())
 }
 
 fn parse_llm_response(
@@ -522,6 +439,31 @@ pub async fn handle_frontend_request(json_data: &str) -> Result<String, String> 
     
     serde_json::to_string(&processed_request)
         .map_err(|e| format!("Failed to serialize processed request: {}", e))
+}
+
+// Bonus tactical additions for enhanced battlefield capabilities
+impl LLMEngine {
+    /// Strategic intelligence gathering - get detailed responses for complex queries
+    pub fn deep_analysis(&self, query: &str, domain: &str, proficiency: &Proficiency) -> Result<String, LLMError> {
+        let system_prompt = format!(
+            "You are a domain expert in {}. Provide detailed, technical analysis suitable for {} level understanding. 
+            Focus on practical insights, common pitfalls, and strategic recommendations.",
+            domain,
+            match proficiency {
+                Proficiency::Beginner => "beginner",
+                Proficiency::Intermediate => "intermediate", 
+                Proficiency::Advanced => "advanced",
+                Proficiency::Expert => "expert",
+            }
+        );
+        
+        let config = GenerationConfig {
+            max_tokens: 800,
+            temperature: 0.3,
+        };
+        
+        self.simple_chat(query, Some(&system_prompt), Some(config))
+    }
 }
 
 #[cfg(test)]

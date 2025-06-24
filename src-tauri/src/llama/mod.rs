@@ -14,7 +14,7 @@ use ffi::RawEngine;
  */
 
 #[derive(Error, Debug)]
-pub enum QwenError {
+pub enum LLMError {
     #[error("Failed to initialize engine with model: {model_path}")]
     InitializationFailed { model_path: String },
     #[error("Engine is not loaded or has been disposed")]
@@ -27,7 +27,7 @@ pub enum QwenError {
     InvalidInput { details: String },
 }
 
-pub type Result<T> = std::result::Result<T, QwenError>;
+pub type Result<T> = std::result::Result<T, LLMError>;
 
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
@@ -57,32 +57,32 @@ pub enum MessageRole {
     Assistant,
 }
 
-pub struct QwenEngine {
+pub struct LLMEngine {
     inner: Arc<Mutex<Option<RawEngine>>>,
     model_path: String,
 }
 
-impl QwenEngine {
+impl LLMEngine {
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
         let path_str = model_path.as_ref().to_string_lossy().to_string();
         if !model_path.as_ref().exists() {
-            return Err(QwenError::ModelNotFound { path: path_str });
+            return Err(LLMError::ModelNotFound { path: path_str });
         }
         let raw_engine = unsafe {
             RawEngine::new(&path_str).ok_or_else(|| {
-                QwenError::InitializationFailed {
+                LLMError::InitializationFailed {
                     model_path: path_str.clone(),
                 }
             })?
         };
-        Ok(QwenEngine {
+        Ok(LLMEngine {
             inner: Arc::new(Mutex::new(Some(raw_engine))),
             model_path: path_str,
         })
     }
     pub fn generate(&self, prompt: &str, config: Option<GenerationConfig>) -> Result<String> {
         if prompt.trim().is_empty() {
-            return Err(QwenError::InvalidInput {
+            return Err(LLMError::InvalidInput {
                 details: "Empty prompt provided".to_string(),
             });
         }
@@ -93,11 +93,11 @@ impl QwenEngine {
                 let result = unsafe {
                     engine.generate(prompt, config.max_tokens, config.temperature)
                 };
-                result.ok_or_else(|| QwenError::GenerationFailed {
+                result.ok_or_else(|| LLMError::GenerationFailed {
                     reason: "C++ engine returned null result".to_string(),
                 })
             }
-            None => Err(QwenError::EngineNotLoaded),
+            None => Err(LLMError::EngineNotLoaded),
         }
     }
     pub fn chat(
@@ -106,7 +106,7 @@ impl QwenEngine {
         config: Option<GenerationConfig>,
     ) -> Result<String> {
         if messages.is_empty() {
-            return Err(QwenError::InvalidInput {
+            return Err(LLMError::InvalidInput {
                 details: "No messages provided".to_string(),
             });
         }
@@ -119,7 +119,7 @@ impl QwenEngine {
             .iter()
             .rev()
             .find(|msg| matches!(msg.role, MessageRole::User))
-            .ok_or_else(|| QwenError::InvalidInput {
+            .ok_or_else(|| LLMError::InvalidInput {
                 details: "No user message found".to_string(),
             })?;
         let guard = self.inner.lock().unwrap();
@@ -128,11 +128,11 @@ impl QwenEngine {
                 let result = unsafe {
                     engine.chat(system_prompt, &user_message.content, config.max_tokens)
                 };
-                result.ok_or_else(|| QwenError::GenerationFailed {
+                result.ok_or_else(|| LLMError::GenerationFailed {
                     reason: "Chat generation failed".to_string(),
                 })
             }
-            None => Err(QwenError::EngineNotLoaded),
+            None => Err(LLMError::EngineNotLoaded),
         }
     }
     pub fn simple_chat(
@@ -177,19 +177,19 @@ impl QwenEngine {
     }
 }
 
-unsafe impl Send for QwenEngine {}
-unsafe impl Sync for QwenEngine {}
+unsafe impl Send for LLMEngine {}
+unsafe impl Sync for LLMEngine {}
 
-impl Clone for QwenEngine {
+impl Clone for LLMEngine {
     fn clone(&self) -> Self {
-        QwenEngine {
+        LLMEngine {
             inner: Arc::clone(&self.inner),
             model_path: self.model_path.clone(),
         }
     }
 }
 
-impl QwenEngine {
+impl LLMEngine {
     pub fn from_models_dir() -> Result<Self> {
         let model_path = "llama/models/qwen2.5-0.5b-instruct-q5_k_m.gguf";
         Self::new(model_path)
@@ -209,12 +209,12 @@ mod tests {
     /*
     #[test]
     fn test_engine_creation() {
-        let engine = QwenEngine::from_models_dir();
+        let engine = LLMEngine::from_models_dir();
         assert!(engine.is_ok(), "Engine creation should succeed with valid model");
     }
     #[test]
     fn test_simple_generation() {
-        let engine = QwenEngine::from_models_dir().unwrap();
+        let engine = LLMEngine::from_models_dir().unwrap();
         let result = engine.complete("Hello, world!");
         assert!(result.is_ok(), "Simple generation should work");
         println!("Generated: {}", result.unwrap());
