@@ -1,3 +1,4 @@
+use crate::sgbd::*;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, Bytes, BytesMut};
 use crc64fast::Digest as Crc64;
@@ -23,32 +24,6 @@ const SEGMENT_MAGIC: &[u8; 4] = b"WAL\x00"; // Segment magic
 const MAX_ENTRY_SIZE: u32 = 16 * 1024 * 1024; // 16MB max entry
 const RECOVERY_BATCH_SIZE: usize = 1000; // Entries per recovery batch
 
-#[derive(Debug, Error)]
-pub enum WalError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Checksum mismatch at offset {offset}")]
-    ChecksumMismatch { offset: u64 },
-    #[error("Corrupted entry at offset {offset}: {reason}")]
-    CorruptedEntry { offset: u64, reason: String },
-    #[error("Invalid frame at offset {offset}: {reason}")]
-    InvalidFrame { offset: u64, reason: String },
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-    #[error("Version mismatch: expected {expected}, found {found}")]
-    VersionMismatch { expected: u16, found: u16 },
-    #[error("Segment creation failed: {0}")]
-    SegmentCreation(String),
-    #[error("Entry too large: {size} bytes (max: {max})")]
-    EntryTooLarge { size: u32, max: u32 },
-    #[error("Timeout: {operation}")]
-    Timeout { operation: String },
-    #[error("Concurrency limit exceeded")]
-    ConcurrencyLimit,
-}
-
-type Result<T> = std::result::Result<T, WalError>;
-
 /// Entry frame structure for bulletproof parsing
 #[derive(Debug, Clone)]
 struct EntryFrame {
@@ -68,23 +43,26 @@ impl EntryFrame {
 
     fn validate(&self) -> Result<()> {
         if self.magic != FRAME_MAGIC {
-            return Err(WalError::InvalidFrame {
-                offset: 0,
-                reason: format!("Invalid magic: {:08x}", self.magic),
+            return Err(SGBDError::Serialization {
+                context: format!("Invalid magic: {:08x}", self.magic),
+                format: SerializationFormat::Bincode,
+                backtrace: None,
             });
         }
 
         if self.length > MAX_ENTRY_SIZE {
-            return Err(WalError::EntryTooLarge {
-                size: self.length,
-                max: MAX_ENTRY_SIZE,
+            return Err(SGBDError::Serialization {
+                context: format!("Entry too large: {} > {}", self.length, MAX_ENTRY_SIZE),
+                format: SerializationFormat::Bincode,
+                backtrace: None,
             });
         }
 
         if self.key_len == 0 {
-            return Err(WalError::InvalidFrame {
-                offset: 0,
-                reason: "Zero key length".to_string(),
+            return Err(SGBDError::Serialization {
+                context: "Zero key length".to_string(),
+                format: SerializationFormat::Bincode,
+                backtrace: None,
             });
         }
 
@@ -92,40 +70,13 @@ impl EntryFrame {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::HEADER_SIZE);
-        buf.extend_from_slice(&self.magic.to_le_bytes());
-        buf.extend_from_slice(&self.length.to_le_bytes());
-        buf.extend_from_slice(&self.crc32.to_le_bytes());
-        buf.extend_from_slice(&self.timestamp.to_le_bytes());
-        buf.extend_from_slice(&self.sequence.to_le_bytes());
-        buf.extend_from_slice(&self.flags.to_le_bytes());
-        buf.extend_from_slice(&self.key_len.to_le_bytes());
-        buf.extend_from_slice(&self.value_len.to_le_bytes());
-        buf
+        // Use the serialization strategy from types.rs (BincodeStrategy)
+        BincodeStrategy.serialize(self).unwrap_or_default()
     }
 
     fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::HEADER_SIZE {
-            return Err(WalError::InvalidFrame {
-                offset: 0,
-                reason: "Insufficient header data".to_string(),
-            });
-        }
-
-        let mut cursor = std::io::Cursor::new(data);
-        let frame = Self {
-            magic: cursor.read_u32::<LittleEndian>()?,
-            length: cursor.read_u32::<LittleEndian>()?,
-            crc32: cursor.read_u32::<LittleEndian>()?,
-            timestamp: cursor.read_u64::<LittleEndian>()?,
-            sequence: cursor.read_u64::<LittleEndian>()?,
-            flags: cursor.read_u32::<LittleEndian>()?,
-            key_len: cursor.read_u32::<LittleEndian>()?,
-            value_len: cursor.read_u32::<LittleEndian>()?,
-        };
-
-        frame.validate()?;
-        Ok(frame)
+        // Use the deserialization strategy from types.rs (BincodeStrategy)
+        BincodeStrategy.deserialize(data)
     }
 }
 
@@ -327,9 +278,10 @@ impl WriteAheadLog {
         position += 8;
 
         if &header[0..4] != SEGMENT_MAGIC {
-            return Err(WalError::CorruptedEntry {
-                offset: 0,
-                reason: "Invalid segment magic".to_string(),
+            return Err(SGBDError::Serialization {
+                context: "Invalid segment magic".to_string(),
+                format: SerializationFormat::Bincode,
+                backtrace: None,
             });
         }
 
@@ -399,7 +351,11 @@ impl WriteAheadLog {
         // Atomically rename temp file to final name
         fs::rename(&temp_path, &file_path)
             .await
-            .map_err(|e| WalError::SegmentCreation(format!("Failed to rename segment: {}", e)))?;
+            .map_err(|e| SGBDError::Io {
+                context: format!("Failed to rename segment: {}", e),
+                source: Some(e.to_string()),
+                backtrace: None,
+            })?;
 
         // Open the finalized file
         let file = OpenOptions::new().append(true).open(&file_path).await?;
@@ -532,16 +488,21 @@ impl WriteAheadLog {
     }
 
     async fn serialize_entry_with_frame(&self, key: &Key, value: &Value) -> Result<Vec<u8>> {
-        let mut key_bytes = key.to_bytes();
-        let mut value_bytes = value.to_bytes()?;
+        let key_bytes = key.to_bytes()?; // Uses types.rs serialization
+        let mut value_bytes = value.to_bytes()?; // Uses types.rs serialization
         let mut flags = 0u32;
 
         // Compression
         if self.config.enable_compression && value_bytes.len() > self.config.compression_threshold {
             let mut encoder = Encoder::new();
-            let compressed = encoder
-                .compress_vec(&value_bytes)
-                .map_err(|e| WalError::Serialization(e.to_string()))?;
+            let compressed =
+                encoder
+                    .compress_vec(&value_bytes)
+                    .map_err(|e| SGBDError::Serialization {
+                        context: e.to_string(),
+                        format: SerializationFormat::Bincode,
+                        backtrace: None,
+                    })?;
 
             if compressed.len() < value_bytes.len() {
                 value_bytes = compressed;
@@ -735,7 +696,7 @@ impl WriteAheadLog {
         reader.read_exact(&mut frame_header).await?;
         *position += EntryFrame::HEADER_SIZE as u64;
 
-        let frame = EntryFrame::from_bytes(&frame_header)?;
+        let frame = EntryFrame::from_bytes(&frame_header)?; // Uses types.rs deserialization
 
         // Read payload
         let payload_size = (frame.key_len + frame.value_len) as usize;
@@ -746,7 +707,11 @@ impl WriteAheadLog {
         // Verify CRC
         let crc = crc32fast::hash(&payload);
         if crc != frame.crc32 {
-            return Err(WalError::ChecksumMismatch { offset: *position });
+            return Err(SGBDError::Serialization {
+                context: format!("Checksum mismatch at offset {}", *position),
+                format: SerializationFormat::Bincode,
+                backtrace: None,
+            });
         }
 
         // Split payload
@@ -758,16 +723,18 @@ impl WriteAheadLog {
             let mut decoder = Decoder::new();
             decoder
                 .decompress_vec(value_bytes)
-                .map_err(|e| WalError::Serialization(e.to_string()))?
+                .map_err(|e| SGBDError::Serialization {
+                    context: e.to_string(),
+                    format: SerializationFormat::Bincode,
+                    backtrace: None,
+                })?
         } else {
             value_bytes.to_vec()
         };
 
         // Deserialize
-        let mut key = Key::from_bytes(key_bytes)?;
-        key.timestamp = frame.timestamp;
-
-        let value = Value::from_bytes(&final_value_bytes)?;
+        let key = Key::from_bytes(key_bytes)?; // Uses types.rs deserialization
+        let value = Value::from_bytes(&final_value_bytes)?; // Uses types.rs deserialization
 
         Ok((key, value, frame.sequence))
     }
@@ -782,9 +749,10 @@ impl WriteAheadLog {
         loop {
             let bytes_read = reader.read(&mut buffer).await?;
             if bytes_read == 0 {
-                return Err(WalError::CorruptedEntry {
-                    offset: position,
-                    reason: "No more valid frames found".to_string(),
+                return Err(SGBDError::Serialization {
+                    context: "No more valid frames found".to_string(),
+                    format: SerializationFormat::Bincode,
+                    backtrace: None,
                 });
             }
 
@@ -1120,123 +1088,6 @@ impl Drop for WriteAheadLog {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Key {
-    pub timestamp: u64,
-    pub namespace: String,
-    pub id: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Value {
-    pub data: Bytes,
-    pub version: u64,
-    pub flags: u32,
-}
-
-impl Key {
-    pub fn new(namespace: String, id: Vec<u8>) -> Self {
-        Self {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64,
-            namespace,
-            id,
-        }
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = BytesMut::new();
-
-        // Serialization format: [namespace_len: 2][namespace][id_len: 4][id]
-        buf.put_u16_le(self.namespace.len() as u16);
-        buf.extend_from_slice(self.namespace.as_bytes());
-        buf.put_u32_le(self.id.len() as u32);
-        buf.extend_from_slice(&self.id);
-
-        buf.freeze().to_vec()
-    }
-
-    fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-
-        // Read namespace
-        let ns_len = cursor
-            .read_u16::<LittleEndian>()
-            .map_err(|e| WalError::Serialization(e.to_string()))? as usize;
-        let mut namespace = vec![0u8; ns_len];
-        cursor
-            .read_exact(&mut namespace)
-            .map_err(|e| WalError::Serialization(e.to_string()))?;
-
-        // Read ID
-        let id_len = cursor
-            .read_u32::<LittleEndian>()
-            .map_err(|e| WalError::Serialization(e.to_string()))? as usize;
-        let mut id = vec![0u8; id_len];
-        cursor
-            .read_exact(&mut id)
-            .map_err(|e| WalError::Serialization(e.to_string()))?;
-
-        Ok(Self {
-            timestamp: 0, // Will be set from frame during replay
-            namespace: String::from_utf8(namespace)
-                .map_err(|e| WalError::Serialization(e.to_string()))?,
-            id,
-        })
-    }
-}
-
-impl Value {
-    pub fn new(data: Bytes) -> Self {
-        Self {
-            data,
-            version: 1,
-            flags: 0,
-        }
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut buf = BytesMut::new();
-
-        // Serialization format: [version: 8][flags: 4][data_len: 4][data]
-        buf.put_u64_le(self.version);
-        buf.put_u32_le(self.flags);
-        buf.put_u32_le(self.data.len() as u32);
-        buf.extend_from_slice(&self.data);
-
-        Ok(buf.freeze().to_vec())
-    }
-
-    fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-
-        let version = cursor
-            .read_u64::<LittleEndian>()
-            .map_err(|e| WalError::Serialization(e.to_string()))?;
-
-        let flags = cursor
-            .read_u32::<LittleEndian>()
-            .map_err(|e| WalError::Serialization(e.to_string()))?;
-
-        let data_len = cursor
-            .read_u32::<LittleEndian>()
-            .map_err(|e| WalError::Serialization(e.to_string()))? as usize;
-
-        let mut value_data = vec![0u8; data_len];
-        cursor
-            .read_exact(&mut value_data)
-            .map_err(|e| WalError::Serialization(e.to_string()))?;
-
-        Ok(Self {
-            data: Bytes::from(value_data),
-            version,
-            flags,
-        })
-    }
-}
-
 // Testing utilities
 #[cfg(test)]
 mod tests {
@@ -1253,8 +1104,9 @@ mod tests {
     async fn test_basic_append_and_replay() {
         let (wal, temp_dir) = create_test_wal().await;
 
-        let key = Key::new("test".to_string(), b"key1".to_vec());
-        let value = Value::new(Bytes::from("value1"));
+        // Use Key and Value constructors from types.rs
+        let key = Key::new_uuid();
+        let value = Value::Raw(Bytes::from("value1"));
 
         wal.append(&key, &value).await.unwrap();
         wal.sync().await.unwrap();

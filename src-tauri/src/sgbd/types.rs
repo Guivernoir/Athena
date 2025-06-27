@@ -470,7 +470,7 @@ impl CompressedData {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CompressionType {
+pub enum Type {
     None,
     Lz4,
     Zstd,
