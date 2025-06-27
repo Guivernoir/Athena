@@ -216,6 +216,24 @@ impl SerializationStrategy for JsonStrategy {
     }
 }
 
+impl SerializationStrategy for MessagePackStrategy {
+    fn serialize<T: Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        rmp_serde::to_vec(value).map_err(SGBDError::from)
+    }
+
+    fn deserialize<T: for<'de> Deserialize<'de>>(&self, bytes: &[u8]) -> Result<T> {
+        rmp_serde::from_slice(bytes).map_err(SGBDError::from)
+    }
+
+    fn format(&self) -> SerializationFormat {
+        SerializationFormat::MessagePack
+    }
+
+    fn name(&self) -> &'static str {
+        "message_pack"
+    }
+}
+
 /// Conversion implementations - because even errors deserve proper manners
 impl From<std::io::Error> for SGBDError {
     fn from(err: std::io::Error) -> Self {
