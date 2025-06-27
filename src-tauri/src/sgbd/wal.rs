@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Write, BufWriter, BufReader, BufRead, Seek, SeekFrom};
-use super::types::{Key, Value, SGBDError, Result};
+use std::io::{Write, BufWriter, BufReader, Read, Seek, SeekFrom};
+use crate::sgbd::{Key, Value, SGBDError, Result};
 
 pub struct WriteAheadLog {
     file: BufWriter<File>,
@@ -86,66 +86,11 @@ impl WriteAheadLog {
         self.file.get_mut().seek(SeekFrom::Start(0))?;
         Ok(())
     }
-}
-
-new(),
-            next_tx_id: 1,
-        }
-    }
     
-    pub fn begin_transaction(&mut self) -> u64 {
-        let tx_id = self.next_tx_id;
-        self.next_tx_id += 1;
-        
-        let tx = Transaction {
-            id: tx_id,
-            operations: Vec::new(),
-            committed: false,
-        };
-        
-        self.active_txs.insert(tx_id, tx);
-        tx_id
-    }
-    
-    pub fn add_operation(&mut self, tx_id: u64, op: TxOperation) -> Result<()> {
-        let tx = self.active_txs
-            .get_mut(&tx_id)
-            .ok_or(SGBDError::TransactionError("Transaction not found".to_string()))?;
-        
-        if tx.committed {
-            return Err(SGBDError::TransactionError("Transaction already committed".to_string()));
-        }
-        
-        tx.operations.push(op);
-        Ok(())
-    }
-    
-    pub async fn commit(&mut self, tx_id: u64, engine: &SGBDEngine) -> Result<()> {
-        let tx = self.active_txs
-            .remove(&tx_id)
-            .ok_or(SGBDError::TransactionError("Transaction not found".to_string()))?;
-        
-        // Execute all operations atomically
-        for op in tx.operations {
-            match op {
-                TxOperation::Put(key, value) => {
-                    // Would integrate with engine.put() here
-                    // For now, this is a placeholder
-                }
-                TxOperation::Delete(key) => {
-                    // Would integrate with engine.delete() here
-                    // For now, this is a placeholder
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    pub fn rollback(&mut self, tx_id: u64) -> Result<()> {
-        self.active_txs
-            .remove(&tx_id)
-            .ok_or(SGBDError::TransactionError("Transaction not found".to_string()))?;
+    pub async fn checkpoint(&mut self) -> Result<()> {
+        // Strategic checkpoint - flush and truncate after successful storage commit
+        self.sync().await?;
+        self.truncate().await?;
         Ok(())
     }
 }

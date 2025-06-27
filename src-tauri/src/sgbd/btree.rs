@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use super::types::{Key, SGBDError, Result};
+use crate::sgbd::{Key, SGBDError, Result};
 
+#[derive(Debug, Clone)]
 pub struct BTreeIndex {
     index: BTreeMap<Key, u64>, // Key -> file offset
 }
@@ -42,5 +43,17 @@ impl BTreeIndex {
     
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+    
+    pub fn first_key(&self) -> Option<&Key> {
+        self.index.first_key_value().map(|(k, _)| k)
+    }
+    
+    pub fn last_key(&self) -> Option<&Key> {
+        self.index.last_key_value().map(|(k, _)| k)
+    }
+    
+    pub fn clear(&mut self) {
+        self.index.clear();
     }
 }
