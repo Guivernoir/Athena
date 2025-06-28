@@ -1,7 +1,7 @@
-use crate::backend::ParsedOutput;
 use crate::llm::{sanitized_input, Mode, ParsedInput, Proficiency, RawOutput};
 use crate::quantization::{QuantizationConfig, Quantizer};
 use crate::sgbd::*;
+use crate::Engine::ParsedOutput;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
