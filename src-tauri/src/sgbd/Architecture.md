@@ -636,3 +636,105 @@ Tests Validate
     Cache hit ratios.
 
     Serialization/deserialization integrity.
+
+# ================= engine.rs ===================
+
+Core Components
+
+    Engine Struct:
+
+        Central orchestrator for all SGBD operations.
+
+        Holds references to storage, transaction manager, WAL, B-Tree index, quantizer, config, state, metrics, and background tasks.
+
+        Uses Arc/RwLock/Mutex for safe async concurrency.
+
+    EngineState:
+
+        Tracks operational status (started, healthy, recovery mode, shutdown requested, last compaction).
+
+    EngineMetrics:
+
+        Collects operation counts, transaction stats, quantization ratio, cache hit rate, response times, and last update timestamp.
+
+    QueryExecution:
+
+        Encapsulates transaction ID, timeout, proficiency, mode, and quantization config for each operation.
+
+Key Functionality
+
+    Initialization & Startup:
+
+        new(): Initializes all subsystems (storage, WAL, index, quantizer, etc.) with config.
+
+        start(): Runs WAL recovery, index rebuild, starts background tasks, and validates health.
+
+    Core Operations:
+
+        get(): ACID-compliant point lookup with cache check, index search, storage fetch, and quantization pipeline.
+
+        set(): Transactional insert/update with WAL logging, quantization, storage write, index update, and cache refresh.
+
+        delete(): Transactional removal with WAL logging, storage tombstone, index update, and cache invalidation.
+
+        range_scan(): Efficient range queries using index, with per-key locking and quantization-aware retrieval.
+
+        batch_execute(): Supports atomic, best-effort, and parallel batch operations with transaction management.
+
+    LLM/AI Integration:
+
+        process_llm_input(): Sanitizes input, creates metadata, stores as InputRecord, and generates output with confidence score and related keys.
+
+    Metrics & Health:
+
+        get_metrics(): Aggregates and updates metrics from all subsystems.
+
+        health_check(): Runs comprehensive diagnostics and triggers compaction if needed.
+
+    Shutdown & Maintenance:
+
+        shutdown(): Graceful shutdown—waits for transactions, flushes WAL/storage, aborts background tasks, and updates state.
+
+        schedule_compaction(), perform_compaction(): Background and on-demand storage compaction with index rebuild.
+
+        Background Tasks: Periodic compaction and metrics update via Tokio tasks.
+
+    Transaction & Locking:
+
+        Full transaction lifecycle (begin/commit/rollback), per-operation locking, and integration with transaction manager.
+
+    Cache Integration:
+
+        Hooks for cache check/update/invalidate via index layer (LRU cache in BTreeIndex).
+
+    Error Handling:
+
+        Rich error taxonomy (SGBDError), timeouts, and resource exhaustion handling.
+
+    Testing:
+
+        Extensive async tests for initialization, lifecycle, CRUD, batch, range scan, metrics, and health.
+
+Design Highlights
+
+    Modern Rust async architecture (Tokio, Arc, RwLock, Mutex).
+
+    ACID compliance via WAL, transaction manager, and locking.
+
+    Pluggable quantization and compression for storage efficiency.
+
+    Modular, extensible, and scope-controlled—advanced features are stubbed for future work.
+
+    Metrics-driven and operationally observable.
+
+Tests Validate
+
+    Engine initialization and lifecycle.
+
+    Correctness of get/set/delete/range_scan.
+
+    Batch operation atomicity and error handling.
+
+    Metrics and health reporting.
+
+    Graceful shutdown
