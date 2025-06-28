@@ -1,11 +1,15 @@
-mod commands;
 use crate::backend::ParsedOutput;
 use crate::llm::{sanitized_input, Mode, ParsedInput, Proficiency, RawOutput};
 use crate::quantization::{QuantizationConfig, Quantizer};
 use crate::sgbd::*;
+
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::timeout;
+use uuid::Uuid;
 
 /// Strategic Database Management Engine
 ///
@@ -14,806 +18,516 @@ use tokio::sync::Mutex;
 /// - Multi-layered caching with battlefield-tested eviction strategies
 /// - ACID transactions with KGB-level reliability
 /// - Index structures that would make MI6 proud
-pub struct SGBDEngine {
-    /// Primary storage layer - the vault
-    storage: Arc<StorageEngine>,
-
-    /// BTree index for tactical key lookups
+pub struct Engine {
+    storage: Arc<RwLock<StorageEngine>>,
+    tx_manager: Arc<TransactionManager>,
+    wal: Arc<Mutex<Wal>>,
     index: Arc<RwLock<BTreeIndex>>,
-
-    /// Write-Ahead Log for atomic operations
-    wal: Arc<Mutex<WriteAheadLog>>,
-
-    /// Quantization engine for surgical data compression
     quantizer: Arc<Quantizer>,
-
-    /// Transaction manager for coordinated operations
-    tx_manager: Arc<Mutex<TransactionManager>>,
-
-    /// Sequential ID generator with atomic precision
-    next_id: Arc<RwLock<u64>>,
-
-    /// L1 cache: Hot data for immediate tactical advantage
-    hot_cache: Arc<RwLock<HashMap<Key, Value>>>,
-
-    /// L2 cache: Quantized data cache for strategic efficiency
-    quant_cache: Arc<RwLock<HashMap<Key, Vec<u8>>>>,
-
-    /// Statistics engine for operational intelligence
-    stats: Arc<RwLock<OperationalStats>>,
-
-    /// Configuration for strategic decision making
-    config: EngineConfig,
+    config: DatabaseConfig,
+    state: Arc<RwLock<EngineState>>,
+    metrics: Arc<RwLock<EngineMetrics>>,
 }
 
+/// Engine operational state - because knowing your position is half the battle
 #[derive(Debug, Clone)]
-pub struct EngineConfig {
-    /// Cache size limits - because memory is finite, strategy is infinite
-    pub hot_cache_limit: usize,
-    pub quant_cache_limit: usize,
-
-    /// Quantization strategy
-    pub quantization_bits: usize,
-    pub quantization_block_size: usize,
-
-    /// Performance tuning
-    pub enable_compression: bool,
-    pub enable_checksums: bool,
-    pub sync_strategy: SyncStrategy,
+pub struct EngineState {
+    pub started: bool,
+    pub healthy: bool,
+    pub last_compaction: Option<Timestamp>,
+    pub recovery_mode: bool,
+    pub shutdown_requested: bool,
 }
 
+/// Engine performance metrics - tactical intelligence on our operations
+#[derive(Debug, Clone, Default)]
+pub struct EngineMetrics {
+    pub operations_total: u64,
+    pub operations_successful: u64,
+    pub operations_failed: u64,
+    pub transactions_committed: u64,
+    pub transactions_aborted: u64,
+    pub quantization_ratio: f64,
+    pub cache_hit_rate: f64,
+    pub average_response_time_ms: f64,
+}
+
+/// Query execution context - mission parameters for data operations
 #[derive(Debug, Clone)]
-pub enum SyncStrategy {
-    /// Immediate sync - maximum durability, tactical response time
-    Immediate,
-    /// Batched sync - strategic efficiency
-    Batched(usize),
-    /// Timed sync - operational balance
-    Timed(std::time::Duration),
+pub struct QueryExecution {
+    pub tx_id: Uuid,
+    pub timeout: Duration,
+    pub proficiency: Proficiency,
+    pub mode: Mode,
+    pub quantization_config: QuantizationConfig,
 }
 
-#[derive(Debug, Default)]
-struct OperationalStats {
-    total_records: u64,
-    cache_hits: u64,
-    cache_misses: u64,
-    quantization_savings: u64,
-    total_operations: u64,
-    avg_compression_ratio: f64,
-    hot_keys: HashMap<String, u64>, // Domain -> access count
-}
+impl Engine {
+    /// Initialize the engine with the precision of a Swiss watchmaker
+    /// and the paranoia of a Cold War intelligence operative
+    pub async fn new(config: DatabaseConfig) -> Result<Self, SGBDError> {
+        // TODO: Implement actual initialization logic
+        // This is where we'd normally perform the tactical deployment:
+        // 1. Initialize storage backend
+        // 2. Start transaction manager
+        // 3. Begin WAL operations
+        // 4. Rebuild indexes from storage
+        // 5. Start background maintenance tasks
 
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            hot_cache_limit: 10_000,
-            quant_cache_limit: 50_000,
-            quantization_bits: 4,
-            quantization_block_size: 128,
-            enable_compression: true,
-            enable_checksums: true,
-            sync_strategy: SyncStrategy::Batched(100),
-        }
-    }
-}
+        let storage = Arc::new(RwLock::new(StorageEngine::new(config.clone()).await?));
 
-impl SGBDEngine {
-    /// Initialize the tactical database engine with surgical precision
-    pub async fn new(db_path: &str) -> Result<Self> {
-        Self::new_with_config(db_path, EngineConfig::default()).await
-    }
+        let tx_manager = Arc::new(TransactionManager::new(config.clone()).await?);
 
-    /// Initialize with custom configuration - for the strategically minded
-    pub async fn new_with_config(db_path: &str, config: EngineConfig) -> Result<Self> {
-        // Initialize core components with military precision
-        let storage = Arc::new(StorageEngine::new(db_path)?);
-        let index = Arc::new(RwLock::new(BTreeIndex::new()));
-        let wal = Arc::new(Mutex::new(WriteAheadLog::new(&format!(
-            "{}/wal.log",
-            db_path
-        ))?));
-        let tx_manager = Arc::new(Mutex::new(TransactionManager::new()));
+        let wal = Arc::new(Mutex::new(Wal::new(config.clone()).await?));
 
-        // Strategic quantization configuration
-        let quant_config = QuantizationConfig {
-            bits: config.quantization_bits,
-            block_size: config.quantization_block_size,
-        };
+        let index = Arc::new(RwLock::new(BTreeIndex::new(config.clone()).await?));
 
-        let quantizer = Arc::new(Quantizer::new(quant_config).map_err(|e| {
-            SGBDError::QuantizationError(format!("Quantizer initialization failed: {:?}", e))
-        })?);
+        let quantizer = Arc::new(Quantizer::new(config.quantization_config.clone())?);
 
-        let engine = Self {
+        let state = Arc::new(RwLock::new(EngineState {
+            started: false,
+            healthy: false,
+            last_compaction: None,
+            recovery_mode: false,
+            shutdown_requested: false,
+        }));
+
+        let metrics = Arc::new(RwLock::new(EngineMetrics::default()));
+
+        Ok(Engine {
             storage,
-            index,
-            wal,
-            quantizer,
             tx_manager,
-            next_id: Arc::new(RwLock::new(1)),
-            hot_cache: Arc::new(RwLock::new(HashMap::new())),
-            quant_cache: Arc::new(RwLock::new(HashMap::new())),
-            stats: Arc::new(RwLock::new(OperationalStats::default())),
+            wal,
+            index,
+            quantizer,
             config,
-        };
-
-        // Tactical recovery: Rebuild indices and restore state
-        engine.execute_recovery_protocol().await?;
-
-        Ok(engine)
+            state,
+            metrics,
+        })
     }
 
-    /// Store input record with maximum compression efficiency
-    /// Returns the tactical key for future operations
-    pub async fn store_input_record(
-        &self,
-        raw_input: String,
-        parsed_input: ParsedInput,
-    ) -> Result<Key> {
-        // Generate unique key with timestamp precision
-        let key = self.generate_tactical_key().await;
+    /// Start the engine with the ceremony of a military parade
+    pub async fn start(&self) -> Result<(), SGBDError> {
+        let mut state = self.state.write().await;
 
-        // Execute quantization protocol with surgical precision
-        let quantized_data = self.execute_quantization(&raw_input).await?;
+        if state.started {
+            return Err(SGBDError::Concurrency("Engine already started".into()));
+        }
 
-        // Calculate compression intelligence
-        let original_size = raw_input.len();
-        let compressed_size = quantized_data.len();
-        let compression_ratio = compressed_size as f32 / original_size as f32;
+        // TODO: Implement startup sequence
+        // 1. Perform WAL recovery
+        // 2. Rebuild indexes from storage
+        // 3. Start background maintenance tasks
+        // 4. Validate system health
 
-        // Construct metadata with operational intelligence
-        let metadata = RecordMetadata {
-            created_at: key.timestamp,
-            input_length: original_size,
-            quantization_bits: self.config.quantization_bits,
-            compression_ratio,
-            domain: parsed_input.domain.clone(),
-            mode: parsed_input.mode.clone(),
-            proficiency: parsed_input.proficiency.clone(),
-        };
+        state.started = true;
+        state.healthy = true;
+        state.recovery_mode = false;
 
-        let record = InputRecord {
-            raw_input: raw_input.clone(),
-            parsed_input,
-            quantized_data: quantized_data.clone(),
-            metadata,
-        };
-
-        let value = Value::InputRecord(record);
-
-        // Execute atomic write operation
-        self.execute_atomic_write(&key, &value).await?;
-
-        // Update operational statistics
-        self.update_tactical_stats(&key, original_size, compressed_size, &raw_input)
-            .await;
-
-        Ok(key)
+        Ok(())
     }
 
-    /// Retrieve record with multi-layer cache strategy
-    pub async fn get_record(&self, key: &Key) -> Result<Option<InputRecord>> {
-        // L1 Cache check - hot data for immediate tactical advantage
-        if let Some(value) = self.check_hot_cache(key).await {
-            if let Value::InputRecord(record) = value {
-                self.increment_cache_hit().await;
-                return Ok(Some(record));
+    /// Execute a strategic data retrieval operation
+    pub async fn get(&self, key: Key, context: QueryExecution) -> Result<Option<Value>, SGBDError> {
+        self.ensure_operational().await?;
+
+        // Begin transaction with the discipline of a chess opening
+        let tx_context = self.begin_transaction(context.clone()).await?;
+
+        let result = timeout(context.timeout, async {
+            // TODO: Implement actual get logic
+            // 1. Acquire shared lock on key
+            // 2. Check index for key location
+            // 3. Retrieve from storage (decompression → decryption)
+            // 4. Dequantize using self.quantizer
+            // 5. Update cache and metrics
+
+            // Placeholder implementation
+            self.perform_get_operation(key, &tx_context).await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(value)) => {
+                self.commit_transaction(tx_context).await?;
+                self.update_metrics(true, "get").await;
+                Ok(value)
             }
-        }
-
-        // L2 Cache check - quantized data reconstruction
-        if let Some(quantized_data) = self.check_quant_cache(key).await {
-            if let Ok(reconstructed) = self.reconstruct_from_quantized(key, &quantized_data).await {
-                self.increment_cache_hit().await;
-                return Ok(Some(reconstructed));
-            }
-        }
-
-        // Storage retrieval - the final frontier
-        self.increment_cache_miss().await;
-        match self.storage.get(key).await? {
-            Some(Value::InputRecord(record)) => {
-                // Strategic cache population
-                self.populate_caches(key, &record).await;
-                Ok(Some(record))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Query by domain with intelligent filtering
-    pub async fn query_by_domain(&self, domain: &str) -> Result<Vec<(Key, InputRecord)>> {
-        let mut results = Vec::new();
-        let mut scan_count = 0u64;
-
-        // Strategic index scan with early termination
-        for (key, offset) in self.index.read().unwrap().iter() {
-            scan_count += 1;
-
-            // Check hot cache first for tactical advantage
-            if let Some(Value::InputRecord(record)) = self.hot_cache.read().unwrap().get(key) {
-                if record.metadata.domain == domain {
-                    results.push((key.clone(), record.clone()));
-                }
-                continue;
-            }
-
-            // Storage lookup with surgical precision
-            if let Some(Value::InputRecord(record)) = self.storage.get_at_offset(*offset).await? {
-                if record.metadata.domain == domain {
-                    results.push((key.clone(), record));
-                }
-            }
-
-            // Tactical limit to prevent resource exhaustion
-            if scan_count > 10_000 {
-                break;
-            }
-        }
-
-        // Update access patterns for strategic intelligence
-        self.update_domain_access_stats(domain).await;
-
-        Ok(results)
-    }
-
-    /// Query by mode and proficiency with precision targeting
-    pub async fn query_by_mode_and_proficiency(
-        &self,
-        mode: &Mode,
-        proficiency: &Proficiency,
-    ) -> Result<Vec<(Key, InputRecord)>> {
-        let mut results = Vec::new();
-
-        // Execute targeted scan with compound filtering
-        for (key, offset) in self.index.read().unwrap().iter() {
-            if let Some(Value::InputRecord(record)) = self.storage.get_at_offset(*offset).await? {
-                if record.metadata.mode == *mode && record.metadata.proficiency == *proficiency {
-                    results.push((key.clone(), record));
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Advanced query with strategic filtering capabilities
-    pub async fn query_advanced(
-        &self,
-        filter: QueryFilter,
-        limit: Option<usize>,
-    ) -> Result<Vec<(Key, InputRecord)>> {
-        let mut results = Vec::new();
-        let mut processed = 0usize;
-
-        for (key, offset) in self.index.read().unwrap().iter() {
-            if let Some(limit_val) = limit {
-                if results.len() >= limit_val {
-                    break;
-                }
-            }
-
-            if let Some(Value::InputRecord(record)) = self.storage.get_at_offset(*offset).await? {
-                if filter.matches(&record) {
-                    results.push((key.clone(), record));
-                }
-            }
-
-            processed += 1;
-            if processed > 50_000 {
-                break; // Strategic circuit breaker
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Execute transaction with ACID guarantees
-    pub async fn execute_transaction<F, T>(&self, operation: F) -> Result<T>
-    where
-        F: FnOnce(&mut TransactionManager) -> Result<T> + Send,
-        T: Send,
-    {
-        let mut tx_manager = self.tx_manager.lock().await;
-        let tx_id = tx_manager.begin_transaction();
-
-        match operation(&mut *tx_manager) {
-            Ok(result) => {
-                let operations = tx_manager.commit_transaction(tx_id)?;
-                // Apply operations to storage
-                for op in operations {
-                    match op {
-                        TxOperation::Put(key, value) => {
-                            self.execute_atomic_write(&key, &value).await?;
-                        }
-                        TxOperation::Delete(key) => {
-                            self.execute_delete(&key).await?;
-                        }
-                    }
-                }
-                Ok(result)
-            }
-            Err(e) => {
-                tx_manager.rollback(tx_id)?;
+            Ok(Err(e)) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "get").await;
                 Err(e)
             }
-        }
-    }
-
-    /// Get comprehensive operational statistics
-    pub async fn get_operational_intelligence(&self) -> Result<HashMap<String, serde_json::Value>> {
-        let stats = self.stats.read().unwrap();
-        let mut intelligence = HashMap::new();
-
-        intelligence.insert("total_records".to_string(), stats.total_records.into());
-        intelligence.insert(
-            "cache_hit_ratio".to_string(),
-            (stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses) as f64).into(),
-        );
-        intelligence.insert(
-            "avg_compression_ratio".to_string(),
-            stats.avg_compression_ratio.into(),
-        );
-        intelligence.insert(
-            "quantization_savings_bytes".to_string(),
-            stats.quantization_savings.into(),
-        );
-        intelligence.insert(
-            "total_operations".to_string(),
-            stats.total_operations.into(),
-        );
-
-        // Hot domains analysis
-        let mut hot_domains = Vec::new();
-        for (domain, count) in &stats.hot_keys {
-            hot_domains.push(serde_json::json!({
-                "domain": domain,
-                "access_count": count
-            }));
-        }
-        intelligence.insert("hot_domains".to_string(), hot_domains.into());
-
-        // Storage statistics
-        let storage_stats = self.storage.get_statistics().await?;
-        intelligence.insert(
-            "storage_stats".to_string(),
-            serde_json::to_value(storage_stats).unwrap_or_default(),
-        );
-
-        Ok(intelligence)
-    }
-
-    /// Execute strategic compaction with data reorganization
-    pub async fn execute_strategic_compaction(&self) -> Result<CompactionReport> {
-        let start_time = std::time::Instant::now();
-
-        // Clear caches for clean slate
-        self.clear_all_caches().await;
-
-        // Execute storage compaction
-        self.storage.compact().await?;
-
-        // Rebuild indices with precision
-        self.execute_recovery_protocol().await?;
-
-        // Generate compaction intelligence
-        let duration = start_time.elapsed();
-        let stats = self.stats.read().unwrap();
-
-        Ok(CompactionReport {
-            duration,
-            records_processed: stats.total_records,
-            space_reclaimed: 0, // TODO: Calculate from storage
-            index_rebuilds: 1,
-        })
-    }
-
-    /// Backup with strategic data preservation
-    pub async fn execute_tactical_backup(&self, backup_path: &str) -> Result<BackupReport> {
-        let start_time = std::time::Instant::now();
-
-        // Execute storage backup
-        self.storage.backup(backup_path).await?;
-
-        // Backup WAL
-        let wal_backup_path = format!("{}/wal_backup.log", backup_path);
-        std::fs::copy(
-            format!("{}/wal.log", self.storage.get_db_path()),
-            wal_backup_path,
-        )?;
-
-        let duration = start_time.elapsed();
-        let stats = self.stats.read().unwrap();
-
-        Ok(BackupReport {
-            duration,
-            records_backed_up: stats.total_records,
-            backup_size: 0, // TODO: Calculate actual size
-        })
-    }
-
-    // === PRIVATE TACTICAL METHODS ===
-
-    async fn generate_tactical_key(&self) -> Key {
-        let mut next_id = self.next_id.write().unwrap();
-        let key = Key::new(*next_id);
-        *next_id += 1;
-        key
-    }
-
-    async fn execute_quantization(&self, raw_input: &str) -> Result<Vec<u8>> {
-        if !self.config.enable_compression {
-            return Ok(raw_input.as_bytes().to_vec());
-        }
-
-        let input_bytes: Vec<f32> = raw_input
-            .bytes()
-            .map(|b| (b as f32 - 128.0) / 128.0) // Normalize to [-1, 1]
-            .collect();
-
-        self.quantizer
-            .quantize(&input_bytes)
-            .map_err(|e| SGBDError::QuantizationError(format!("Quantization failed: {:?}", e)))
-    }
-
-    async fn execute_atomic_write(&self, key: &Key, value: &Value) -> Result<()> {
-        // WAL first - atomic guarantee
-        {
-            let mut wal = self.wal.lock().await;
-            wal.append_entry(key, value).await?;
-
-            match &self.config.sync_strategy {
-                SyncStrategy::Immediate => wal.sync().await?,
-                _ => {} // Batched sync handled elsewhere
+            Err(_) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "get").await;
+                Err(SGBDError::ResourceExhausted("Query timeout".into()))
             }
         }
-
-        // Storage write
-        self.storage.put(key, value).await?;
-
-        // Index update
-        {
-            let mut index = self.index.write().unwrap();
-            if let Ok(offset) = self.storage.get_page_offset_async(key).await {
-                index.insert(key.clone(), offset);
-            }
-        }
-
-        // Hot cache population
-        {
-            let mut hot_cache = self.hot_cache.write().unwrap();
-            if hot_cache.len() < self.config.hot_cache_limit {
-                hot_cache.insert(key.clone(), value.clone());
-            }
-        }
-
-        Ok(())
     }
 
-    async fn execute_delete(&self, key: &Key) -> Result<()> {
-        // Clear from all caches
-        {
-            let mut hot_cache = self.hot_cache.write().unwrap();
-            hot_cache.remove(key);
-        }
-        {
-            let mut quant_cache = self.quant_cache.write().unwrap();
-            quant_cache.remove(key);
-        }
-
-        // Remove from index
-        {
-            let mut index = self.index.write().unwrap();
-            index.remove(key);
-        }
-
-        // Note: Physical deletion from storage would require compaction
-        Ok(())
-    }
-
-    async fn execute_recovery_protocol(&self) -> Result<()> {
-        // Scan storage and rebuild index
-        let page_map = self.storage.scan_all_pages().await?;
-
-        {
-            let mut index = self.index.write().unwrap();
-            index.clear();
-            for (key, offset) in page_map {
-                index.insert(key, offset);
-            }
-        }
-
-        // Update next_id based on recovered keys
-        {
-            let index = self.index.read().unwrap();
-            if let Some(max_id) = index.keys().map(|k| k.id).max() {
-                let mut next_id = self.next_id.write().unwrap();
-                *next_id = max_id + 1;
-            }
-        }
-
-        // Replay WAL if necessary
-        let wal_entries = {
-            let wal = self.wal.lock().await;
-            wal.replay()?
-        };
-
-        for (key, value) in wal_entries {
-            self.storage.put(&key, &value).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn check_hot_cache(&self, key: &Key) -> Option<Value> {
-        self.hot_cache.read().unwrap().get(key).cloned()
-    }
-
-    async fn check_quant_cache(&self, key: &Key) -> Option<Vec<u8>> {
-        self.quant_cache.read().unwrap().get(key).cloned()
-    }
-
-    async fn reconstruct_from_quantized(
+    /// Execute a tactical data insertion operation
+    pub async fn set(
         &self,
-        key: &Key,
-        quantized_data: &[u8],
-    ) -> Result<InputRecord> {
-        // This would require storing metadata separately for reconstruction
-        // For now, return error to force storage lookup
-        Err(SGBDError::IndexError(
-            "Quantized reconstruction not implemented".to_string(),
-        ))
-    }
+        key: Key,
+        value: Value,
+        context: QueryExecution,
+    ) -> Result<(), SGBDError> {
+        self.ensure_operational().await?;
 
-    async fn populate_caches(&self, key: &Key, record: &InputRecord) {
-        // Hot cache
-        {
-            let mut hot_cache = self.hot_cache.write().unwrap();
-            if hot_cache.len() < self.config.hot_cache_limit {
-                hot_cache.insert(key.clone(), Value::InputRecord(record.clone()));
+        let tx_context = self.begin_transaction(context.clone()).await?;
+
+        let result = timeout(context.timeout, async {
+            // TODO: Implement actual set logic
+            // 1. Acquire exclusive lock on key
+            // 2. Quantize value using self.quantizer
+            // 3. Pass to storage for encryption → compression
+            // 4. Write to WAL
+            // 5. Update index
+            // 6. Update cache
+
+            self.perform_set_operation(key, value, &tx_context).await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) => {
+                self.commit_transaction(tx_context).await?;
+                self.update_metrics(true, "set").await;
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "set").await;
+                Err(e)
+            }
+            Err(_) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "set").await;
+                Err(SGBDError::ResourceExhausted("Query timeout".into()))
             }
         }
+    }
 
-        // Quantized cache
-        {
-            let mut quant_cache = self.quant_cache.write().unwrap();
-            if quant_cache.len() < self.config.quant_cache_limit {
-                quant_cache.insert(key.clone(), record.quantized_data.clone());
+    /// Execute a precision strike data deletion
+    pub async fn delete(&self, key: Key, context: QueryExecution) -> Result<bool, SGBDError> {
+        self.ensure_operational().await?;
+
+        let tx_context = self.begin_transaction(context.clone()).await?;
+
+        let result = timeout(context.timeout, async {
+            // TODO: Implement actual delete logic
+            // 1. Acquire exclusive lock on key
+            // 2. Check if key exists
+            // 3. Write tombstone to WAL
+            // 4. Update index
+            // 5. Mark as deleted in storage
+
+            self.perform_delete_operation(key, &tx_context).await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(deleted)) => {
+                self.commit_transaction(tx_context).await?;
+                self.update_metrics(true, "delete").await;
+                Ok(deleted)
+            }
+            Ok(Err(e)) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "delete").await;
+                Err(e)
+            }
+            Err(_) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "delete").await;
+                Err(SGBDError::ResourceExhausted("Query timeout".into()))
             }
         }
     }
 
-    async fn clear_all_caches(&self) {
-        {
-            let mut hot_cache = self.hot_cache.write().unwrap();
-            hot_cache.clear();
-        }
-        {
-            let mut quant_cache = self.quant_cache.write().unwrap();
-            quant_cache.clear();
-        }
-    }
-
-    async fn increment_cache_hit(&self) {
-        let mut stats = self.stats.write().unwrap();
-        stats.cache_hits += 1;
-        stats.total_operations += 1;
-    }
-
-    async fn increment_cache_miss(&self) {
-        let mut stats = self.stats.write().unwrap();
-        stats.cache_misses += 1;
-        stats.total_operations += 1;
-    }
-
-    async fn update_tactical_stats(
+    /// Execute a reconnaissance mission across key ranges
+    pub async fn range_scan(
         &self,
-        key: &Key,
-        original_size: usize,
-        compressed_size: usize,
-        raw_input: &str,
-    ) {
-        let mut stats = self.stats.write().unwrap();
-        stats.total_records += 1;
-        stats.quantization_savings += (original_size - compressed_size) as u64;
+        start_key: Key,
+        end_key: Key,
+        limit: Option<usize>,
+        context: QueryExecution,
+    ) -> Result<Vec<(Key, Value)>, SGBDError> {
+        self.ensure_operational().await?;
 
-        // Update compression ratio running average
-        let new_ratio = compressed_size as f64 / original_size as f64;
-        stats.avg_compression_ratio =
-            (stats.avg_compression_ratio * (stats.total_records - 1) as f64 + new_ratio)
-                / stats.total_records as f64;
-    }
+        let tx_context = self.begin_transaction(context.clone()).await?;
 
-    async fn update_domain_access_stats(&self, domain: &str) {
-        let mut stats = self.stats.write().unwrap();
-        *stats.hot_keys.entry(domain.to_string()).or_insert(0) += 1;
-    }
-}
+        let result = timeout(context.timeout, async {
+            // TODO: Implement actual range scan logic
+            // 1. Acquire shared locks on key range
+            // 2. Perform index range scan
+            // 3. Retrieve values from storage (decompression → decryption)
+            // 4. Dequantize results using self.quantizer
+            // 5. Apply limit and filtering
 
-#[derive(Debug, Clone)]
-pub struct QueryFilter {
-    pub domain: Option<String>,
-    pub mode: Option<Mode>,
-    pub proficiency: Option<Proficiency>,
-    pub min_compression_ratio: Option<f32>,
-    pub max_compression_ratio: Option<f32>,
-    pub after_timestamp: Option<u64>,
-    pub before_timestamp: Option<u64>,
-}
-
-impl QueryFilter {
-    pub fn new() -> Self {
-        Self {
-            domain: None,
-            mode: None,
-            proficiency: None,
-            min_compression_ratio: None,
-            max_compression_ratio: None,
-            after_timestamp: None,
-            before_timestamp: None,
-        }
-    }
-
-    pub fn domain(mut self, domain: String) -> Self {
-        self.domain = Some(domain);
-        self
-    }
-
-    pub fn mode(mut self, mode: Mode) -> Self {
-        self.mode = Some(mode);
-        self
-    }
-
-    pub fn proficiency(mut self, proficiency: Proficiency) -> Self {
-        self.proficiency = Some(proficiency);
-        self
-    }
-
-    fn matches(&self, record: &InputRecord) -> bool {
-        if let Some(ref domain) = self.domain {
-            if record.metadata.domain != *domain {
-                return false;
-            }
-        }
-
-        if let Some(ref mode) = self.mode {
-            if record.metadata.mode != *mode {
-                return false;
-            }
-        }
-
-        if let Some(ref proficiency) = self.proficiency {
-            if record.metadata.proficiency != *proficiency {
-                return false;
-            }
-        }
-
-        if let Some(min_ratio) = self.min_compression_ratio {
-            if record.metadata.compression_ratio < min_ratio {
-                return false;
-            }
-        }
-
-        if let Some(max_ratio) = self.max_compression_ratio {
-            if record.metadata.compression_ratio > max_ratio {
-                return false;
-            }
-        }
-
-        if let Some(after) = self.after_timestamp {
-            if record.metadata.created_at <= after {
-                return false;
-            }
-        }
-
-        if let Some(before) = self.before_timestamp {
-            if record.metadata.created_at >= before {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-#[derive(Debug)]
-pub struct CompactionReport {
-    pub duration: std::time::Duration,
-    pub records_processed: u64,
-    pub space_reclaimed: u64,
-    pub index_rebuilds: u32,
-}
-
-#[derive(Debug)]
-pub struct BackupReport {
-    pub duration: std::time::Duration,
-    pub records_backed_up: u64,
-    pub backup_size: u64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile;
-    use tokio;
-
-    #[tokio::test]
-    async fn test_tactical_operations() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().to_str().unwrap();
-
-        let engine = SGBDEngine::new(db_path).await.unwrap();
-
-        let test_input = "SELECT * FROM classified_operations WHERE clearance_level = 'TOP_SECRET'";
-        let parsed_input = ParsedInput {
-            domain: "intelligence".to_string(),
-            mode: Mode::Query,
-            proficiency: Proficiency::Expert,
-            confidence: 0.98,
-        };
-
-        let key = engine
-            .store_input_record(test_input.to_string(), parsed_input)
-            .await
-            .unwrap();
-        let retrieved = engine.get_record(&key).await.unwrap();
-
-        assert!(retrieved.is_some());
-        let record = retrieved.unwrap();
-        assert_eq!(record.raw_input, test_input);
-        assert!(record.metadata.compression_ratio < 1.0); // Should be compressed
-
-        // Test query capabilities
-        let domain_results = engine.query_by_domain("intelligence").await.unwrap();
-        assert_eq!(domain_results.len(), 1);
-
-        // Test operational intelligence
-        let intel = engine.get_operational_intelligence().await.unwrap();
-        assert!(intel.contains_key("total_records"));
-        assert!(intel.contains_key("cache_hit_ratio"));
-    }
-
-    #[tokio::test]
-    async fn test_advanced_query_filter() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().to_str().unwrap();
-
-        let engine = SGBDEngine::new(db_path).await.unwrap();
-
-        // Store multiple records with different characteristics
-        for i in 0..5 {
-            let test_input = format!("Operation {}: Execute tactical maneuver", i);
-            let parsed_input = ParsedInput {
-                domain: if i % 2 == 0 { "tactical" } else { "strategic" }.to_string(),
-                mode: Mode::Query,
-                proficiency: if i < 3 {
-                    Proficiency::Advanced
-                } else {
-                    Proficiency::Expert
-                },
-                confidence: 0.9,
-            };
-
-            engine
-                .store_input_record(test_input, parsed_input)
+            self.perform_range_scan_operation(start_key, end_key, limit, &tx_context)
                 .await
-                .unwrap();
+        })
+        .await;
+
+        match result {
+            Ok(Ok(results)) => {
+                self.commit_transaction(tx_context).await?;
+                self.update_metrics(true, "range_scan").await;
+                Ok(results)
+            }
+            Ok(Err(e)) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "range_scan").await;
+                Err(e)
+            }
+            Err(_) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "range_scan").await;
+                Err(SGBDError::ResourceExhausted("Query timeout".into()))
+            }
+        }
+    }
+
+    /// Execute batch operations with atomic precision
+    pub async fn batch_execute(
+        &self,
+        operations: Vec<BatchOperation>,
+        context: QueryExecution,
+    ) -> Result<BatchResult, SGBDError> {
+        self.ensure_operational().await?;
+
+        let tx_context = self.begin_transaction(context.clone()).await?;
+
+        let result = timeout(context.timeout, async {
+            // TODO: Implement actual batch execution logic
+            // 1. Acquire locks for all operations
+            // 2. Execute operations in order
+            // 3. Handle rollback on failure (if atomic mode)
+            // 4. Collect results and metrics
+
+            self.perform_batch_operations(operations, &tx_context).await
+        })
+        .await;
+
+        match result {
+            Ok(Ok(batch_result)) => {
+                self.commit_transaction(tx_context).await?;
+                self.update_metrics(true, "batch").await;
+                Ok(batch_result)
+            }
+            Ok(Err(e)) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "batch").await;
+                Err(e)
+            }
+            Err(_) => {
+                self.rollback_transaction(tx_context).await?;
+                self.update_metrics(false, "batch").await;
+                Err(SGBDError::ResourceExhausted("Query timeout".into()))
+            }
+        }
+    }
+
+    /// Process LLM input through the full pipeline
+    pub async fn process_llm_input(
+        &self,
+        input: ParsedInput,
+        context: QueryExecution,
+    ) -> Result<ParsedOutput, SGBDError> {
+        // TODO: Implement LLM input processing
+        // 1. Sanitize input
+        // 2. Store as InputRecord value
+        // 3. Let storage pipeline handle quantization → encryption → compression
+
+        let sanitized = sanitized_input(&input.raw_text, context.mode)?;
+
+        // Store the input data - quantization happens in storage pipeline
+        let key = Key::new_with_id(KeyId::Custom(input.id.into()));
+        let value = Value::InputRecord(InputRecord {
+            raw_io: input.raw_text.into(),
+            parsed_data: Some(sanitized.into()),
+            quantized_data: None, // Will be filled by storage pipeline
+            metadata: RecordMetadata::default(),
+            relationships: Vec::new(),
+        });
+
+        self.set(key, value, context).await?;
+
+        // TODO: Create proper ParsedOutput
+        Ok(ParsedOutput {
+            // Placeholder fields - implement based on actual ParsedOutput structure
+        })
+    }
+
+    /// Retrieve engine performance metrics
+    pub async fn get_metrics(&self) -> EngineMetrics {
+        self.metrics.read().await.clone()
+    }
+
+    /// Perform health check with diagnostic precision
+    pub async fn health_check(&self) -> Result<SystemMetrics, SGBDError> {
+        // TODO: Implement comprehensive health check
+        // 1. Check storage health
+        // 2. Verify transaction manager status
+        // 3. Validate WAL integrity
+        // 4. Check index consistency
+        // 5. Assess system resources
+
+        let state = self.state.read().await;
+        if !state.healthy {
+            return Err(SGBDError::ResourceExhausted("Engine unhealthy".into()));
         }
 
-        // Test advanced filtering
-        let filter = QueryFilter::new()
-            .domain("tactical".to_string())
-            .proficiency(Proficiency::Advanced);
+        Ok(SystemMetrics::default())
+    }
 
-        let results = engine.query_advanced(filter, Some(10)).await.unwrap();
+    /// Graceful shutdown with the discipline of a military retreat
+    pub async fn shutdown(&self) -> Result<(), SGBDError> {
+        let mut state = self.state.write().await;
+        state.shutdown_requested = true;
 
-        // Should find records that match both domain and proficiency
-        assert!(results.len() > 0);
-        for (_, record) in results {
-            assert_eq!(record.metadata.domain, "tactical");
-            assert_eq!(record.metadata.proficiency, Proficiency::Advanced);
+        // TODO: Implement graceful shutdown
+        // 1. Stop accepting new operations
+        // 2. Wait for active transactions to complete
+        // 3. Flush WAL and storage
+        // 4. Stop background tasks
+        // 5. Clean up resources
+
+        state.started = false;
+        state.healthy = false;
+
+        Ok(())
+    }
+
+    // Private methods - the classified operations manual
+
+    async fn ensure_operational(&self) -> Result<(), SGBDError> {
+        let state = self.state.read().await;
+        if !state.started {
+            return Err(SGBDError::ResourceExhausted("Engine not started".into()));
         }
+        if !state.healthy {
+            return Err(SGBDError::ResourceExhausted("Engine unhealthy".into()));
+        }
+        if state.shutdown_requested {
+            return Err(SGBDError::ResourceExhausted("Engine shutting down".into()));
+        }
+        Ok(())
+    }
+
+    async fn begin_transaction(
+        &self,
+        context: QueryExecution,
+    ) -> Result<TransactionContext, SGBDError> {
+        // TODO: Implement transaction begin logic
+        // Use the provided tx_id from context or generate new one
+        Ok(TransactionContext::default())
+    }
+
+    async fn commit_transaction(&self, _tx_context: TransactionContext) -> Result<(), SGBDError> {
+        // TODO: Implement transaction commit logic
+        Ok(())
+    }
+
+    async fn rollback_transaction(&self, _tx_context: TransactionContext) -> Result<(), SGBDError> {
+        // TODO: Implement transaction rollback logic
+        Ok(())
+    }
+
+    async fn perform_get_operation(
+        &self,
+        _key: Key,
+        _tx_context: &TransactionContext,
+    ) -> Result<Option<Value>, SGBDError> {
+        // TODO: Implement actual get operation
+        // 1. Retrieve from storage (handles decompression → decryption)
+        // 2. Dequantize the retrieved data using self.quantizer
+        // 3. Return reconstructed value
+        Ok(None)
+    }
+
+    async fn perform_set_operation(
+        &self,
+        _key: Key,
+        _value: Value,
+        _tx_context: &TransactionContext,
+    ) -> Result<(), SGBDError> {
+        // TODO: Implement actual set operation
+        // 1. Quantize value data using self.quantizer
+        // 2. Pass quantized data to storage (which handles encryption → compression)
+        // 3. Update index with location
+        // 4. Write to WAL for durability
+        Ok(())
+    }
+
+    async fn perform_delete_operation(
+        &self,
+        _key: Key,
+        _tx_context: &TransactionContext,
+    ) -> Result<bool, SGBDError> {
+        // TODO: Implement actual delete operation
+        Ok(false)
+    }
+
+    async fn perform_range_scan_operation(
+        &self,
+        _start_key: Key,
+        _end_key: Key,
+        _limit: Option<usize>,
+        _tx_context: &TransactionContext,
+    ) -> Result<Vec<(Key, Value)>, SGBDError> {
+        // TODO: Implement actual range scan operation
+        Ok(Vec::new())
+    }
+
+    async fn perform_batch_operations(
+        &self,
+        _operations: Vec<BatchOperation>,
+        _tx_context: &TransactionContext,
+    ) -> Result<BatchResult, SGBDError> {
+        // TODO: Implement actual batch operations
+        Ok(BatchResult::default())
+    }
+
+    async fn update_metrics(&self, success: bool, operation: &str) {
+        let mut metrics = self.metrics.write().await;
+        metrics.operations_total += 1;
+        if success {
+            metrics.operations_successful += 1;
+        } else {
+            metrics.operations_failed += 1;
+        }
+        // TODO: Update specific metrics based on operation type
     }
 }
 
-// Well, that was quite the strategic decision, wasn't it?
+/// Convenience methods for common operations
+impl Engine {
+    /// Create a default query execution context
+    pub fn default_query_context() -> QueryExecution {
+        QueryExecution {
+            tx_id: Uuid::new_v4(),
+            timeout: Duration::from_secs(30),
+            proficiency: Proficiency::Expert,
+            mode: Mode::Production,
+            quantization_config: QuantizationConfig::default(),
+        }
+    }
+
+    /// Simple get operation with default context
+    pub async fn simple_get(&self, key: Key) -> Result<Option<Value>, SGBDError> {
+        self.get(key, Self::default_query_context()).await
+    }
+
+    /// Simple set operation with default context
+    pub async fn simple_set(&self, key: Key, value: Value) -> Result<(), SGBDError> {
+        self.set(key, value, Self::default_query_context()).await
+    }
+
+    /// Simple delete operation with default context
+    pub async fn simple_delete(&self, key: Key) -> Result<bool, SGBDError> {
+        self.delete(key, Self::default_query_context()).await
+    }
+}
