@@ -1,7 +1,6 @@
-// tx.rs
-use crate::types::{
+use crate::sgbd::{
     DatabaseConfig, IsolationLevel, Key, LockInfo, LockType, Result, SGBDError, Savepoint,
-    TransactionContext, Timestamp,
+    Timestamp, TransactionContext,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -85,7 +84,7 @@ impl TransactionManager {
     /// Begin a new transaction
     pub async fn begin(&self, isolation_level: IsolationLevel) -> Result<TransactionContext> {
         let mut state = self.state.write().await;
-        
+
         // Enforce max connections
         if state.active_transactions.len() >= self.config.max_connections as usize {
             return Err(SGBDError::ResourceExhausted {
@@ -117,7 +116,7 @@ impl TransactionManager {
         // Release all locks and notify waiters
         for lock in &tx.locks {
             state.lock_table.remove(&lock.key);
-            
+
             // Notify any waiters for this key
             let mut key_notify = self.key_notify.lock().await;
             if let Some(notify) = key_notify.remove(&lock.key) {
@@ -128,7 +127,10 @@ impl TransactionManager {
         // Remove from active transactions
         state.active_transactions.remove(&tx_id);
         state.metrics.active_count.fetch_sub(1, Ordering::Relaxed);
-        state.metrics.committed_count.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .committed_count
+            .fetch_add(1, Ordering::Relaxed);
 
         // Remove from queue and wait-for graph
         if let Some(pos) = state.transaction_queue.iter().position(|id| *id == tx_id) {
@@ -154,7 +156,7 @@ impl TransactionManager {
         // Release all locks and notify waiters
         for lock in &tx.locks {
             state.lock_table.remove(&lock.key);
-            
+
             // Notify any waiters for this key
             let mut key_notify = self.key_notify.lock().await;
             if let Some(notify) = key_notify.remove(&lock.key) {
@@ -165,7 +167,10 @@ impl TransactionManager {
         // Remove from active transactions
         state.active_transactions.remove(&tx_id);
         state.metrics.active_count.fetch_sub(1, Ordering::Relaxed);
-        state.metrics.rolled_back_count.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .rolled_back_count
+            .fetch_add(1, Ordering::Relaxed);
 
         // Remove from queue and wait-for graph
         if let Some(pos) = state.transaction_queue.iter().position(|id| *id == tx_id) {
@@ -177,11 +182,7 @@ impl TransactionManager {
     }
 
     /// Rollback to a savepoint
-    pub async fn rollback_to_savepoint(
-        &self,
-        tx_id: Uuid,
-        savepoint_name: &str,
-    ) -> Result<()> {
+    pub async fn rollback_to_savepoint(&self, tx_id: Uuid, savepoint_name: &str) -> Result<()> {
         let mut state = self.state.write().await;
         let tx = state
             .active_transactions
@@ -204,14 +205,11 @@ impl TransactionManager {
             })?;
 
         // Release locks acquired after this savepoint
-        let locks_to_release: Vec<_> = tx
-            .locks
-            .drain(savepoint_pos..)
-            .collect();
+        let locks_to_release: Vec<_> = tx.locks.drain(savepoint_pos..).collect();
 
         for lock in locks_to_release {
             state.lock_table.remove(&lock.key);
-            
+
             // Notify any waiters for this key
             let mut key_notify = self.key_notify.lock().await;
             if let Some(notify) = key_notify.remove(&lock.key) {
@@ -226,15 +224,10 @@ impl TransactionManager {
     }
 
     /// Acquire a lock with timeout and deadlock detection
-    pub async fn acquire_lock(
-        &self,
-        tx_id: Uuid,
-        key: Key,
-        lock_type: LockType,
-    ) -> Result<()> {
+    pub async fn acquire_lock(&self, tx_id: Uuid, key: Key, lock_type: LockType) -> Result<()> {
         let start = Instant::now();
         let mut state = self.state.write().await;
-        
+
         // Check transaction validity
         if !state.active_transactions.contains_key(&tx_id) {
             return Err(SGBDError::Transaction {
@@ -259,7 +252,7 @@ impl TransactionManager {
             if existing_lock.lock_type.conflicts_with(&lock_type) {
                 // Get transaction holding the lock
                 let holder_id = existing_lock.tx_id;
-                
+
                 // Add to wait-for graph
                 state
                     .wait_for_graph
@@ -287,7 +280,7 @@ impl TransactionManager {
 
                 // Release state lock while waiting
                 drop(state);
-                
+
                 // Wait for notification or timeout
                 let timeout = Duration::from_millis(self.config.lock_timeout_ms);
                 tokio::select! {
@@ -314,7 +307,7 @@ impl TransactionManager {
         };
 
         state.lock_table.insert(key, lock_info.clone());
-        
+
         // Add to transaction
         if let Some(tx) = state.active_transactions.get_mut(&tx_id) {
             tx.locks.push(lock_info);
@@ -325,8 +318,14 @@ impl TransactionManager {
 
         // Update metrics
         let wait_time = start.elapsed().as_micros() as u64;
-        state.metrics.lock_wait_time_us.fetch_add(wait_time, Ordering::Relaxed);
-        state.metrics.lock_wait_count.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .lock_wait_time_us
+            .fetch_add(wait_time, Ordering::Relaxed);
+        state
+            .metrics
+            .lock_wait_count
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -340,10 +339,10 @@ impl TransactionManager {
 
         while let Some(node) = stack.last().copied() {
             visited.insert(node);
-            
+
             if let Some(neighbors) = graph.get(&node) {
                 let mut has_unvisited = false;
-                
+
                 for &neighbor in neighbors {
                     if !visited.contains(&neighbor) {
                         if !on_stack.insert(neighbor) {
@@ -358,7 +357,7 @@ impl TransactionManager {
                         return true;
                     }
                 }
-                
+
                 if !has_unvisited {
                     on_stack.remove(&stack.pop().unwrap());
                 }
@@ -366,14 +365,14 @@ impl TransactionManager {
                 stack.pop();
             }
         }
-        
+
         false
     }
 
     /// Background deadlock detection task
     async fn deadlock_detection_task(self) {
         let interval = Duration::from_millis(self.config.deadlock_detection_interval_ms);
-        
+
         loop {
             tokio::select! {
                 _ = time::sleep(interval) => {
@@ -395,16 +394,16 @@ impl TransactionManager {
     async fn resolve_deadlocks(&self) -> Result<()> {
         let state = self.state.read().await;
         let graph = &state.wait_for_graph;
-        
+
         // Find all transactions in cycles
         let mut victims = Vec::new();
         let mut visited = HashSet::new();
-        
+
         for &tx_id in graph.keys() {
             if visited.contains(&tx_id) {
                 continue;
             }
-            
+
             let mut path = Vec::new();
             if self.find_cycle_dfs(graph, tx_id, &mut visited, &mut path, &mut HashSet::new()) {
                 if let Some(victim) = self.select_victim(&path, &state).await {
@@ -412,15 +411,15 @@ impl TransactionManager {
                 }
             }
         }
-        
+
         // Release lock before rolling back
         drop(state);
-        
+
         // Abort victim transactions
         for victim in victims {
             self.rollback(victim).await?;
         }
-        
+
         Ok(())
     }
 
@@ -436,7 +435,7 @@ impl TransactionManager {
         visited.insert(node);
         path.push(node);
         current_path.insert(node);
-        
+
         if let Some(neighbors) = graph.get(&node) {
             for &neighbor in neighbors {
                 if !visited.contains(&neighbor) {
@@ -449,18 +448,14 @@ impl TransactionManager {
                 }
             }
         }
-        
+
         path.pop();
         current_path.remove(&node);
         false
     }
 
     /// Select victim transaction to abort
-    async fn select_victim(
-        &self,
-        cycle: &[Uuid],
-        state: &TxManagerState,
-    ) -> Option<Uuid> {
+    async fn select_victim(&self, cycle: &[Uuid], state: &TxManagerState) -> Option<Uuid> {
         cycle
             .iter()
             .min_by_key(|&&tx_id| {
@@ -498,7 +493,7 @@ impl TransactionManager {
         let state = self.state.read().await;
         let wait_count = state.metrics.lock_wait_count.load(Ordering::Relaxed);
         let total_wait = state.metrics.lock_wait_time_us.load(Ordering::Relaxed);
-        
+
         TxMetricsSnapshot {
             active: state.metrics.active_count.load(Ordering::Relaxed),
             committed: state.metrics.committed_count.load(Ordering::Relaxed),
@@ -515,15 +510,17 @@ impl TransactionManager {
     /// Gracefully shutdown transaction manager
     pub async fn shutdown(&self) {
         self.shutdown.notify_one();
-        
+
         // Wait for active transactions to complete
         let timeout = Duration::from_millis(self.config.connection_timeout_ms);
         let start = Instant::now();
-        
+
         while self.metrics().await.active > 0 {
             if start.elapsed() > timeout {
-                log::warn!("Transaction shutdown timed out with {} active transactions", 
-                    self.metrics().await.active);
+                log::warn!(
+                    "Transaction shutdown timed out with {} active transactions",
+                    self.metrics().await.active
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -571,7 +568,7 @@ mod tests {
         let manager = test_manager().await;
         let tx = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         manager.commit(tx.id).await.unwrap();
-        
+
         let metrics = manager.metrics().await;
         assert_eq!(metrics.active, 0);
         assert_eq!(metrics.committed, 1);
@@ -582,7 +579,7 @@ mod tests {
         let manager = test_manager().await;
         let tx = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         manager.rollback(tx.id).await.unwrap();
-        
+
         let metrics = manager.metrics().await;
         assert_eq!(metrics.active, 0);
         assert_eq!(metrics.rolled_back, 1);
@@ -593,15 +590,15 @@ mod tests {
         let manager = test_manager().await;
         let tx1 = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         let key = Key::new_uuid();
-        
+
         // First lock should succeed
         manager
             .acquire_lock(tx1.id, key.clone(), LockType::Shared)
             .await
             .unwrap();
-        
+
         let tx2 = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
-        
+
         // Conflicting lock should fail after timeout
         assert!(manager
             .acquire_lock(tx2.id, key.clone(), LockType::Exclusive)
@@ -614,12 +611,12 @@ mod tests {
         let manager = test_manager().await;
         let tx = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         let key = Key::new_uuid();
-        
+
         manager
             .acquire_lock(tx.id, key.clone(), LockType::Shared)
             .await
             .unwrap();
-        
+
         // Upgrade to exclusive should succeed
         manager
             .acquire_lock(tx.id, key.clone(), LockType::Exclusive)
@@ -632,22 +629,22 @@ mod tests {
         let manager = test_manager().await;
         let key1 = Key::new_uuid();
         let key2 = Key::new_uuid();
-        
+
         let tx1 = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         let tx2 = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
-        
+
         // TX1 locks key1
         manager
             .acquire_lock(tx1.id, key1.clone(), LockType::Exclusive)
             .await
             .unwrap();
-        
+
         // TX2 locks key2
         manager
             .acquire_lock(tx2.id, key2.clone(), LockType::Exclusive)
             .await
             .unwrap();
-        
+
         // TX1 tries to lock key2 (will wait)
         let handle1 = tokio::spawn({
             let manager = manager.clone();
@@ -657,7 +654,7 @@ mod tests {
                     .await
             }
         });
-        
+
         // TX2 tries to lock key1 (will cause deadlock)
         let handle2 = tokio::spawn({
             let manager = manager.clone();
@@ -668,16 +665,16 @@ mod tests {
                     .await
             }
         });
-        
+
         // One of them should be aborted due to deadlock
         let result1 = handle1.await.unwrap();
         let result2 = handle2.await.unwrap();
-        
+
         assert!(
             result1.is_err() || result2.is_err(),
             "One transaction should have been aborted"
         );
-        
+
         let metrics = manager.metrics().await;
         assert_eq!(metrics.deadlocks, 1);
     }
@@ -687,24 +684,21 @@ mod tests {
         let manager = test_manager().await;
         let tx = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         let key = Key::new_uuid();
-        
+
         manager
             .create_savepoint(tx.id, "sp1".to_string(), 100)
             .await
             .unwrap();
-        
+
         // Acquire lock after savepoint
         manager
             .acquire_lock(tx.id, key.clone(), LockType::Shared)
             .await
             .unwrap();
-        
+
         // Rollback to savepoint
-        manager
-            .rollback_to_savepoint(tx.id, "sp1")
-            .await
-            .unwrap();
-        
+        manager.rollback_to_savepoint(tx.id, "sp1").await.unwrap();
+
         // Lock should have been released
         let state = manager.state.read().await;
         assert!(!state.lock_table.contains_key(&key));
@@ -715,13 +709,13 @@ mod tests {
         let manager = test_manager().await;
         let tx = manager.begin(IsolationLevel::ReadCommitted).await.unwrap();
         let key = Key::new_uuid();
-        
+
         // Acquire and hold lock
         manager
             .acquire_lock(tx.id, key.clone(), LockType::Exclusive)
             .await
             .unwrap();
-        
+
         // Start shutdown
         let handle = tokio::spawn({
             let manager = manager.clone();
@@ -729,7 +723,7 @@ mod tests {
                 manager.shutdown().await;
             }
         });
-        
+
         // Verify shutdown completes
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
