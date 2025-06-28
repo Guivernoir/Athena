@@ -1,7 +1,7 @@
-use std::env;
+use crate::llama::{ChatMessage, GenerationConfig, LLMEngine, LLMError, MessageRole};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::Arc;
-use crate::llama::{LLMEngine, GenerationConfig, ChatMessage, MessageRole, LLMError};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -93,7 +93,9 @@ impl Proficiency {
     pub fn get_system_prompt(&self) -> String {
         let proficiency_context = match self {
             Proficiency::Beginner => "The user is a beginner in this topic.",
-            Proficiency::Intermediate => "The user has an intermediate understanding of this topic.",
+            Proficiency::Intermediate => {
+                "The user has an intermediate understanding of this topic."
+            }
             Proficiency::Advanced => "The user has an advanced understanding of this topic.",
             Proficiency::Expert => "The user is an expert in this topic.",
         };
@@ -161,65 +163,17 @@ impl<'de> Deserialize<'de> for Proficiency {
     }
 }
 
-pub async fn load_config() -> Result<Config, String> {
-    let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| ".env".to_string());
-    if let Ok(config_content) = std::fs::read_to_string(&config_path) {
-        if let Ok(config) = serde_json::from_str::<Config>(&config_content) {
-            return Ok(config);
-        }
-    }
-    
-    load_config_from_env().await
-}
-
-pub async fn load_config_from_env() -> Result<Config, String> {
-    dotenv::dotenv().ok(); 
-    
-    let model_path = env::var("MODEL_PATH")
-        .unwrap_or_else(|_| "llama/models/qwen2.5-0.5b-instruct-q5_k_m.gguf".to_string());
-    
-    let number_of_queries = env::var("NUMBER_OF_QUERIES")
-        .unwrap_or_else(|_| "5".to_string())
-        .parse::<i32>()
-        .map_err(|_| "Invalid NUMBER_OF_QUERIES format".to_string())?;
-    
-    let max_research_loops = env::var("MAX_RESEARCH_LOOPS")
-        .unwrap_or_else(|_| "3".to_string())
-        .parse::<u32>()
-        .map_err(|_| "Invalid MAX_RESEARCH_LOOPS format".to_string())?;
-
-    let max_tokens = env::var("MAX_TOKENS")
-        .unwrap_or_else(|_| "150".to_string())
-        .parse::<i32>()
-        .map_err(|_| "Invalid MAX_TOKENS format".to_string())?;
-
-    let temperature = env::var("TEMPERATURE")
-        .unwrap_or_else(|_| "0.1".to_string())
-        .parse::<f32>()
-        .map_err(|_| "Invalid TEMPERATURE format".to_string())?;
-
-    Ok(Config {
-        model_path,
-        number_of_queries,
-        max_research_loops,
-        generation_config: GenerationConfig {
-            max_tokens,
-            temperature,
-        },
-    })
-}
-
 pub async fn receive_input(input: String) -> Result<String, String> {
     if input.trim().is_empty() {
         return Err("Input cannot be empty".to_string());
     }
-    
+
     let sanitized_input = input.trim().to_string();
-    
+
     if sanitized_input.len() > 10000 {
         return Err("Input too long (max 10000 characters)".to_string());
     }
-    
+
     Ok(sanitized_input)
 }
 
@@ -230,15 +184,15 @@ pub async fn process_with_llm(
     config: &Config,
 ) -> Result<ParsedInput, String> {
     const MAX_RETRIES: u32 = 3;
-    
+
     // Initialize the LLM engine - no more network calls, comrade
     let engine = LLMEngine::new(&config.model_path)
         .map_err(|e| format!("Failed to initialize LLM engine: {}", e))?;
-    
+
     if !engine.is_loaded() {
         return Err("LLM engine failed to load model".to_string());
     }
-    
+
     let system_prompt = format!(
         "You are an intelligent parsing assistant for a tutoring chatbot. Your task is to analyze user input and extract structured information.
 
@@ -260,9 +214,13 @@ Example output:
         mode.get_system_prompt(),
         proficiency.get_system_prompt()
     );
-    
+
     for attempt in 1..=MAX_RETRIES {
-        match engine.simple_chat(input, Some(&system_prompt), Some(config.generation_config.clone())) {
+        match engine.simple_chat(
+            input,
+            Some(&system_prompt),
+            Some(config.generation_config.clone()),
+        ) {
             Ok(response_content) => {
                 match parse_llm_response(&response_content, input, mode, proficiency) {
                     Ok(parsed_input) => return Ok(parsed_input),
@@ -271,22 +229,31 @@ Example output:
                             // On final attempt, return a fallback response
                             return Ok(create_fallback_response(input, mode, proficiency));
                         }
-                        eprintln!("Parse attempt {}/{} failed: {}", attempt, MAX_RETRIES, parse_error);
+                        eprintln!(
+                            "Parse attempt {}/{} failed: {}",
+                            attempt, MAX_RETRIES, parse_error
+                        );
                     }
                 }
             }
             Err(llm_error) => {
                 if attempt == MAX_RETRIES {
-                    return Err(format!("All {} attempts failed. Last error: {}", MAX_RETRIES, llm_error));
+                    return Err(format!(
+                        "All {} attempts failed. Last error: {}",
+                        MAX_RETRIES, llm_error
+                    ));
                 }
-                eprintln!("LLM attempt {}/{} failed: {}", attempt, MAX_RETRIES, llm_error);
+                eprintln!(
+                    "LLM attempt {}/{} failed: {}",
+                    attempt, MAX_RETRIES, llm_error
+                );
             }
         }
-        
+
         // Brief tactical pause before retry - even local models need a moment
         tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt as u64)).await;
     }
-    
+
     // This should never be reached due to the logic above, but just in case
     Err("Unexpected error in retry logic".to_string())
 }
@@ -299,15 +266,15 @@ fn parse_llm_response(
 ) -> Result<ParsedInput, String> {
     // Try to extract JSON from the response
     let json_str = extract_json_from_response(response_content)?;
-    
+
     let parsed_response: LLMParsedResponse = serde_json::from_str(&json_str)
         .map_err(|e| format!("Failed to parse LLM JSON response: {}", e))?;
-    
+
     // Validate and sanitize the parsed fields
     let action = sanitize_field(&parsed_response.action, "general");
     let domain = sanitize_field(&parsed_response.domain, "general");
     let topic = sanitize_field(&parsed_response.topic, "general");
-    
+
     Ok(ParsedInput {
         action,
         domain,
@@ -320,7 +287,7 @@ fn parse_llm_response(
 
 fn extract_json_from_response(response: &str) -> Result<String, String> {
     let response = response.trim();
-    
+
     if let Some(start) = response.find('{') {
         if let Some(end) = response.rfind('}') {
             if start <= end {
@@ -328,8 +295,11 @@ fn extract_json_from_response(response: &str) -> Result<String, String> {
             }
         }
     }
-    
-    Err(format!("No valid JSON object found in response: {}", response))
+
+    Err(format!(
+        "No valid JSON object found in response: {}",
+        response
+    ))
 }
 
 fn sanitize_field(field: &str, default: &str) -> String {
@@ -337,18 +307,21 @@ fn sanitize_field(field: &str, default: &str) -> String {
     if sanitized.is_empty() || sanitized == "unknown" || sanitized == "null" {
         default.to_string()
     } else {
-        sanitized.chars().take(50).filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect()
+        sanitized
+            .chars()
+            .take(50)
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect()
     }
 }
 
-fn create_fallback_response(
-    input: &str,
-    mode: &Mode,
-    proficiency: &Proficiency,
-) -> ParsedInput {
+fn create_fallback_response(input: &str, mode: &Mode, proficiency: &Proficiency) -> ParsedInput {
     let input_lower = input.to_lowercase();
-    
-    let action = if input_lower.contains("explain") || input_lower.contains("what") || input_lower.contains("how") {
+
+    let action = if input_lower.contains("explain")
+        || input_lower.contains("what")
+        || input_lower.contains("how")
+    {
         "explain"
     } else if input_lower.contains("help") || input_lower.contains("assist") {
         "help"
@@ -359,7 +332,7 @@ fn create_fallback_response(
     } else {
         "general"
     };
-    
+
     let domain = if input_lower.contains("rust") || input_lower.contains("rs") {
         "rust"
     } else if input_lower.contains("cpp") || input_lower.contains("c++") {
@@ -387,7 +360,7 @@ fn create_fallback_response(
     } else {
         "general"
     };
-    
+
     let topic = if input_lower.contains("lifetime") {
         "lifetimes"
     } else if input_lower.contains("borrow") {
@@ -401,7 +374,7 @@ fn create_fallback_response(
     } else {
         "general"
     };
-    
+
     ParsedInput {
         action: action.to_string(),
         domain: domain.to_string(),
@@ -418,10 +391,10 @@ pub async fn process_request(data: Data) -> Result<ProcessedRequest, String> {
     let proficiency = Proficiency::from_u32(data.proficiency)?;
     let original_input = receive_input(data.input).await?;
     let processed_input = process_with_llm(&original_input, &mode, &proficiency, &config).await?;
-    
+
     let processed_input_string = serde_json::to_string(&processed_input)
         .map_err(|e| format!("Failed to serialize parsed input: {}", e))?;
-    
+
     Ok(ProcessedRequest {
         mode,
         proficiency,
@@ -434,9 +407,9 @@ pub async fn process_request(data: Data) -> Result<ProcessedRequest, String> {
 pub async fn handle_frontend_request(json_data: &str) -> Result<String, String> {
     let data: Data = serde_json::from_str(json_data)
         .map_err(|e| format!("Failed to parse JSON input: {}", e))?;
-    
+
     let processed_request = process_request(data).await?;
-    
+
     serde_json::to_string(&processed_request)
         .map_err(|e| format!("Failed to serialize processed request: {}", e))
 }
@@ -444,7 +417,12 @@ pub async fn handle_frontend_request(json_data: &str) -> Result<String, String> 
 // Bonus tactical additions for enhanced battlefield capabilities
 impl LLMEngine {
     /// Strategic intelligence gathering - get detailed responses for complex queries
-    pub fn deep_analysis(&self, query: &str, domain: &str, proficiency: &Proficiency) -> Result<String, LLMError> {
+    pub fn deep_analysis(
+        &self,
+        query: &str,
+        domain: &str,
+        proficiency: &Proficiency,
+    ) -> Result<String, LLMError> {
         let system_prompt = format!(
             "You are a domain expert in {}. Provide detailed, technical analysis suitable for {} level understanding. 
             Focus on practical insights, common pitfalls, and strategic recommendations.",
@@ -456,12 +434,12 @@ impl LLMEngine {
                 Proficiency::Expert => "expert",
             }
         );
-        
+
         let config = GenerationConfig {
             max_tokens: 800,
             temperature: 0.3,
         };
-        
+
         self.simple_chat(query, Some(&system_prompt), Some(config))
     }
 }
@@ -480,9 +458,18 @@ mod tests {
 
     #[test]
     fn test_proficiency_conversion() {
-        assert!(matches!(Proficiency::from_u32(0), Ok(Proficiency::Beginner)));
-        assert!(matches!(Proficiency::from_u32(1), Ok(Proficiency::Intermediate)));
-        assert!(matches!(Proficiency::from_u32(2), Ok(Proficiency::Advanced)));
+        assert!(matches!(
+            Proficiency::from_u32(0),
+            Ok(Proficiency::Beginner)
+        ));
+        assert!(matches!(
+            Proficiency::from_u32(1),
+            Ok(Proficiency::Intermediate)
+        ));
+        assert!(matches!(
+            Proficiency::from_u32(2),
+            Ok(Proficiency::Advanced)
+        ));
         assert!(matches!(Proficiency::from_u32(3), Ok(Proficiency::Expert)));
         assert!(Proficiency::from_u32(4).is_err());
     }
@@ -498,10 +485,10 @@ mod tests {
     fn test_extract_json_from_response() {
         let response1 = r#"{"action": "explain", "domain": "rust", "topic": "lifetimes"}"#;
         assert!(extract_json_from_response(response1).is_ok());
-        
+
         let response2 = r#"Here's the parsed result: {"action": "help", "domain": "python", "topic": "syntax"} - done!"#;
         assert!(extract_json_from_response(response2).is_ok());
-        
+
         let response3 = "No JSON here";
         assert!(extract_json_from_response(response3).is_err());
     }
@@ -518,8 +505,9 @@ mod tests {
     fn test_fallback_response() {
         let mode = Mode::Tutor;
         let proficiency = Proficiency::Beginner;
-        
-        let result = create_fallback_response("How do lifetimes work in Rust?", &mode, &proficiency);
+
+        let result =
+            create_fallback_response("How do lifetimes work in Rust?", &mode, &proficiency);
         assert_eq!(result.action, "explain");
         assert_eq!(result.domain, "rust");
         assert_eq!(result.topic, "lifetimes");
