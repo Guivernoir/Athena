@@ -8,7 +8,7 @@ use std::os::raw::{c_char, c_float, c_int, c_void};
  * Handle with appropriate tactical caution - one wrong pointer dereference
  * and your entire operation goes sideways faster than a chess match with Kasparov.
  */
-
+#[link(name = "llama")]
 extern "C" {
     fn qwen_engine_create(model_path: *const c_char) -> *mut c_void;
     fn qwen_engine_destroy(engine: *mut c_void);

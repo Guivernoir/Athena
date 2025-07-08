@@ -1,36 +1,75 @@
+use crate::preprocessing::{
+    router::{Mode, Proficiency, Personality},
+    context::Context,
+    cleaner::Cleaner,
+};
 use tauri::command;
-use crate::llm::{self, Data, Mode, Proficiency};
-use serde_json;
+use crate::llama;
 
-#[tauri::command]
-pub async fn receive_input(input: String) -> Result<String, String> {
-    llm::receive_input(input).await
+// State management
+pub struct AppState {
+    pub mode: Option<Mode>,
+    pub proficiency: Option<Proficiency>,
+    pub personality: Option<Personality>,
+    pub context: Option<Context>,
 }
 
 #[tauri::command]
-pub async fn receive_mode(mode: u32) -> Result<String, String> {
-    Mode::from_u32(mode)
-        .map(|m| format!("{:?}", m))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn receive_proficiency(proficiency: u32) -> Result<String, String> {
-    Proficiency::from_u32(proficiency)
-        .map(|p| format!("{:?}", p))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn send_output(mode: u32, proficiency: u32, input: String) -> Result<String, String> {
-    let data = Data {
-        mode,
-        proficiency,
-        input,
-    };
+pub async fn receive_input(
+    input: String,
+    llm: tauri::State<'_, llama::LLMEngine>,
+    state: tauri::State<'_, std::sync::Mutex<AppState>>,
+) -> Result<String, String> {
+    let cleaned = Cleaner::clean(&input)
+        .map_err(|e| format!("Input cleaning failed: {}", e))?;
     
-    let json_data = serde_json::to_string(&data)
-        .map_err(|e| format!("Failed to serialize input data: {}", e))?;
+    let context = Context::analyze(cleaned, &llm).await
+        .map_err(|e| format!("Context analysis failed: {}", e))?;
     
-    llm::process_complete_request(&json_data).await
+    state.lock().unwrap().context = Some(context);
+    Ok("Input analyzed successfully".to_string())
+}
+
+#[tauri::command]
+pub async fn receive_mode(
+    mode: u32,
+    state: tauri::State<'_, std::sync::Mutex<AppState>>,
+) -> Result<String, String> {
+    let mode = Mode::select_mode(mode).await?;
+    state.lock().unwrap().mode = Some(mode);
+    Ok("Mode set successfully".to_string())
+}
+
+#[tauri::command]
+pub async fn receive_proficiency(
+    proficiency: u32,
+    state: tauri::State<'_, std::sync::Mutex<AppState>>,
+) -> Result<String, String> {
+    let prof = Proficiency::select_proficiency(proficiency).await?;
+    state.lock().unwrap().proficiency = Some(prof);
+    Ok("Proficiency set successfully".to_string())
+}
+
+#[tauri::command]
+pub async fn receive_personality(
+    personality: u32,
+    state: tauri::State<'_, std::sync::Mutex<AppState>>,
+) -> Result<String, String> {
+    let pers = Personality::select_personality(personality).await?;
+    state.lock().unwrap().personality = Some(pers);
+    Ok("Personality set successfully".to_string())
+}
+
+#[tauri::command]
+pub async fn send_output(
+    llm: tauri::State<'_, llama::LLMEngine>,
+    state: tauri::State<'_, std::sync::Mutex<AppState>>,
+) -> Result<String, String> {
+    let state_guard = state.lock().unwrap();
+    let context = state_guard.context.as_ref()
+        .ok_or("No context available")?;
+    
+    // Generate response based on stored context
+    llm.generate(&context.raw_input, None)
+        .map_err(|e| e.to_string())
 }

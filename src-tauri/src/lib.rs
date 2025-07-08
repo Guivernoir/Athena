@@ -1,6 +1,8 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 mod commands;
+pub mod preprocessing;
+pub mod llama;
 pub mod llm;
 
 use crate::commands::*;

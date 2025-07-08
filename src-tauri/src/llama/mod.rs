@@ -206,7 +206,6 @@ impl LLMEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /*
     #[test]
     fn test_engine_creation() {
         let engine = LLMEngine::from_models_dir();
@@ -219,5 +218,5 @@ mod tests {
         assert!(result.is_ok(), "Simple generation should work");
         println!("Generated: {}", result.unwrap());
     }
-    */
+    
 }
