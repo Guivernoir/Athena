@@ -1,5 +1,5 @@
 use crate::embedding::EmbeddingEngine;
-use crate::preprocessor::formatter::*;
+use crate::vector::security;
 use thiserror::Error;
 use std::sync::Arc;
 

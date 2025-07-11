@@ -4,19 +4,22 @@ use crate::formatter::QdrantPoint;
 use crate::schema::qdrant_point_to_point_struct;
 use qdrant_client::qdrant::{UpsertPoints, PointStruct};
 use std::sync::Arc;
+use crate::security::{VectorSecurity, Quantizer}; // <-- import security
 
 pub struct VectorInserter {
     client: Arc<QdrantClient>,
+    key: [u8; 32],
+    quantizer: Quantizer,
 }
 
 impl VectorInserter {
-    pub fn new(client: Arc<QdrantClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<QdrantClient>, key: [u8; 32], quantizer: Quantizer) -> Self {
+        Self { client, key, quantizer }
     }
     
     pub async fn insert_single(&self, formatted_input: &FormattedInput) -> Result<String, VectorDbError> {
-        let point = &formatted_input.qdrant_point;
-        
+        let mut point = formatted_input.qdrant_point.clone();
+
         // Validate vector dimensions
         if point.vector.len() != self.client.get_vector_size() as usize {
             return Err(VectorDbError::InvalidVectorDimensions {
@@ -24,21 +27,27 @@ impl VectorInserter {
                 actual: point.vector.len(),
             });
         }
-        
-        let point_struct = qdrant_point_to_point_struct(point);
-        
+
+        // Secure the vector
+        let secured = VectorSecurity::prepare_for_storage(&point.vector, &self.key, &self.quantizer)
+            .map_err(|e| VectorDbError::InsertFailed(format!("Security pipeline failed: {}", e)))?;
+        point.vector = vec![]; // clear original
+        point.payload.secured_vector = Some(secured); // assumes payload has this field
+
+        let point_struct = qdrant_point_to_point_struct(&point);
+
         let upsert_points = UpsertPoints {
             collection_name: self.client.get_collection_name().to_string(),
             points: vec![point_struct],
             ..Default::default()
         };
-        
+
         self.client
             .get_client()
             .upsert_points(&upsert_points)
             .await
             .map_err(|e| VectorDbError::InsertFailed(format!("Failed to insert point: {}", e)))?;
-        
+
         Ok(point.id.clone())
     }
     
@@ -46,13 +55,13 @@ impl VectorInserter {
         if formatted_inputs.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         let mut point_structs = Vec::new();
         let mut ids = Vec::new();
-        
+
         for formatted_input in formatted_inputs {
-            let point = &formatted_input.qdrant_point;
-            
+            let mut point = formatted_input.qdrant_point.clone();
+
             // Validate vector dimensions
             if point.vector.len() != self.client.get_vector_size() as usize {
                 return Err(VectorDbError::InvalidVectorDimensions {
@@ -60,27 +69,35 @@ impl VectorInserter {
                     actual: point.vector.len(),
                 });
             }
-            
-            point_structs.push(qdrant_point_to_point_struct(point));
+
+            // Secure the vector
+            let secured = VectorSecurity::prepare_for_storage(&point.vector, &self.key, &self.quantizer)
+                .map_err(|e| VectorDbError::InsertFailed(format!("Security pipeline failed: {}", e)))?;
+            point.vector = vec![];
+            point.payload.secured_vector = Some(secured);
+
+            point_structs.push(qdrant_point_to_point_struct(&point));
             ids.push(point.id.clone());
         }
-        
+
         let upsert_points = UpsertPoints {
             collection_name: self.client.get_collection_name().to_string(),
             points: point_structs,
             ..Default::default()
         };
-        
+
         self.client
             .get_client()
             .upsert_points(&upsert_points)
             .await
             .map_err(|e| VectorDbError::InsertFailed(format!("Failed to insert batch: {}", e)))?;
-        
+
         Ok(ids)
     }
     
     pub async fn insert_raw_point(&self, point: &QdrantPoint) -> Result<String, VectorDbError> {
+        let mut point = point.clone();
+
         // Validate vector dimensions
         if point.vector.len() != self.client.get_vector_size() as usize {
             return Err(VectorDbError::InvalidVectorDimensions {
@@ -88,27 +105,33 @@ impl VectorInserter {
                 actual: point.vector.len(),
             });
         }
-        
-        let point_struct = qdrant_point_to_point_struct(point);
-        
+
+        // Secure the vector
+        let secured = VectorSecurity::prepare_for_storage(&point.vector, &self.key, &self.quantizer)
+            .map_err(|e| VectorDbError::InsertFailed(format!("Security pipeline failed: {}", e)))?;
+        point.vector = vec![];
+        point.payload.secured_vector = Some(secured);
+
+        let point_struct = qdrant_point_to_point_struct(&point);
+
         let upsert_points = UpsertPoints {
             collection_name: self.client.get_collection_name().to_string(),
             points: vec![point_struct],
             ..Default::default()
         };
-        
+
         self.client
             .get_client()
             .upsert_points(&upsert_points)
             .await
             .map_err(|e| VectorDbError::InsertFailed(format!("Failed to insert raw point: {}", e)))?;
-        
+
         Ok(point.id.clone())
     }
     
     pub async fn update_point(&self, id: &str, formatted_input: &FormattedInput) -> Result<(), VectorDbError> {
-        let point = &formatted_input.qdrant_point;
-        
+        let mut point = formatted_input.qdrant_point.clone();
+
         // Validate vector dimensions
         if point.vector.len() != self.client.get_vector_size() as usize {
             return Err(VectorDbError::InvalidVectorDimensions {
@@ -116,29 +139,34 @@ impl VectorInserter {
                 actual: point.vector.len(),
             });
         }
-        
+
+        // Secure the vector
+        let secured = VectorSecurity::prepare_for_storage(&point.vector, &self.key, &self.quantizer)
+            .map_err(|e| VectorDbError::InsertFailed(format!("Security pipeline failed: {}", e)))?;
+        point.vector = vec![];
+        point.payload.secured_vector = Some(secured);
+
         // Create a new point with the specified id
-        let mut updated_point = point.clone();
-        updated_point.id = id.to_string();
-        updated_point.payload.updated_at = std::time::SystemTime::now()
+        point.id = id.to_string();
+        point.payload.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        
-        let point_struct = qdrant_point_to_point_struct(&updated_point);
-        
+
+        let point_struct = qdrant_point_to_point_struct(&point);
+
         let upsert_points = UpsertPoints {
             collection_name: self.client.get_collection_name().to_string(),
             points: vec![point_struct],
             ..Default::default()
         };
-        
+
         self.client
             .get_client()
             .upsert_points(&upsert_points)
             .await
             .map_err(|e| VectorDbError::InsertFailed(format!("Failed to update point: {}", e)))?;
-        
+
         Ok(())
     }
     

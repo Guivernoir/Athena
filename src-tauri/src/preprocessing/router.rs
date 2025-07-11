@@ -4,8 +4,7 @@ use serde_json;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Mode{
     Tutor,
-    Assistant,
-    WebSearch
+    Assistant
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -20,7 +19,8 @@ pub enum Proficiency{
 pub enum Personality{
     Erika,
     Aurora,
-    Ekaterina
+    Ekaterina,
+    Viktor
 }
 
 impl Mode{
@@ -28,7 +28,6 @@ impl Mode{
         match mode {
             0 => Ok(Mode::Tutor),
             1 => Ok(Mode::Assistant),
-            2 => Ok(Mode::WebSearch),
             _ => Err("Invalid mode selected!".to_string())
         }
     }
@@ -52,6 +51,7 @@ impl Personality{
             0 => Ok(Personality::Erika),
             1 => Ok(Personality::Aurora),
             2 => Ok(Personality::Ekaterina),
+            3 => Ok(Personality::Viktor),
             _ => Err("Invalid personality selected!".to_string())
         }
     }

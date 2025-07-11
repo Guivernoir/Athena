@@ -3,6 +3,7 @@ pub mod schema;
 pub mod insert;
 pub mod query;
 pub mod embedding;
+pub mod security;
 
 pub use client::QdrantClient;
 pub use schema::*;

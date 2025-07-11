@@ -43,6 +43,7 @@ qdrant-client = "1.7"
 aes-gcm = "0.10"
 flate2 = "1.0"
 rand_core = "0.6"
+toml = "0.5.4"
 
 [features]
 default = ["custom-protocol"]

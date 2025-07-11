@@ -15,6 +15,7 @@ pub fn run() {
             receive_input,
             receive_mode,
             receive_proficiency,
+            receive_personality,
             send_output
         ])
         .run(tauri::generate_context!())

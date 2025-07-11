@@ -1,9 +1,10 @@
 mod encryption;
 mod compression;
+mod quantizer;
 
 pub use encryption::{encrypt_data, decrypt_data, generate_key};
 pub use compression::{compress_data, decompress_data};
-use crate::quantizer::{Quantizer, QuantizationError};
+pub use quantizer::{Quantizer, QuantizationError};
 
 /// Security processor for embedded vector data
 pub struct VectorSecurity;
