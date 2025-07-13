@@ -10,56 +10,38 @@ use crate::router::{Mode, Proficiency, Personality};
 pub enum FormatterError {
     #[error("Failed to serialize formatted input: {0}")]
     SerializationFailed(String),
-    #[error("Failed to generate embeddings: {0}")]
-    EmbeddingFailed(String),
     #[error("Invalid payload structure: {0}")]
     InvalidPayload(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct QdrantPoint {
+pub struct SqliteVecRecord {
     pub id: String,
     pub vector: Vec<f32>,
-    pub payload: QdrantPayload,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct QdrantPayload {
-    // Core content
     pub raw_input: String,
     pub cleaned_input: String,
     pub action: String,
     pub domain: String,
     pub topic: String,
-    
-    // Processing metadata
     pub mode: String,
     pub proficiency: String,
     pub personality: String,
-    
-    // Token information
     pub word_count: i64,
     pub sentence_count: i64,
-    pub token_preview: String, // First 10 tokens for quick reference
-    
-    // Calculated metrics
+    pub token_preview: String,
     pub complexity_score: f32,
     pub estimated_processing_time: i64,
     pub suggested_response_length: String,
-    
-    // Indexing fields for efficient querying
     pub domain_category: String,
     pub complexity_tier: String,
     pub proficiency_level: String,
-    
-    // Timestamps
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FormattedInput {
-    pub qdrant_point: QdrantPoint,
+    pub sqlite_vec_record: SqliteVecRecord,
     pub context: Context,
     pub tokens: TokenInfo,
     pub mode: Mode,
@@ -93,10 +75,9 @@ impl FormattedInput {
         vector: Vec<f32>,
     ) -> Result<Self, FormatterError> {
         let metadata = Self::calculate_metadata(&context, &tokens, &proficiency);
-        let qdrant_point = Self::build_qdrant_point(&context, &tokens, &mode, &proficiency, &personality, &metadata, vector)?;
-        
+        let sqlite_vec_record = Self::build_sqlite_vec_record(&context, &tokens, &mode, &proficiency, &personality, &metadata, vector)?;
         Ok(Self {
-            qdrant_point,
+            sqlite_vec_record,
             context,
             tokens,
             mode,
@@ -105,8 +86,8 @@ impl FormattedInput {
             metadata,
         })
     }
-    
-    fn build_qdrant_point(
+
+    fn build_sqlite_vec_record(
         context: &Context,
         tokens: &TokenInfo,
         mode: &Mode,
@@ -114,50 +95,41 @@ impl FormattedInput {
         personality: &Personality,
         metadata: &InputMetadata,
         vector: Vec<f32>,
-    ) -> Result<QdrantPoint, FormatterError> {
+    ) -> Result<SqliteVecRecord, FormatterError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        
+
         let token_preview = tokens.tokens
             .iter()
             .take(10)
             .cloned()
             .collect::<Vec<_>>()
             .join(" ");
-        
-        let payload = QdrantPayload {
+
+        Ok(SqliteVecRecord {
+            id: Uuid::new_v4().to_string(),
+            vector,
             raw_input: context.raw_input.clone(),
-            cleaned_input: context.raw_input.clone(), // Assuming cleaned version
+            cleaned_input: context.raw_input.clone(), // Placeholder for cleaned version
             action: context.action.clone(),
             domain: context.domain.clone(),
             topic: context.topic.clone(),
-            
             mode: format!("{:?}", mode),
             proficiency: format!("{:?}", proficiency),
             personality: format!("{:?}", personality),
-            
             word_count: tokens.word_count as i64,
             sentence_count: tokens.sentence_count as i64,
             token_preview,
-            
             complexity_score: metadata.complexity_score,
             estimated_processing_time: metadata.estimated_processing_time as i64,
             suggested_response_length: format!("{:?}", metadata.suggested_response_length),
-            
             domain_category: Self::categorize_domain(&context.domain),
             complexity_tier: Self::categorize_complexity(metadata.complexity_score),
             proficiency_level: Self::map_proficiency_level(proficiency),
-            
             created_at: now,
             updated_at: now,
-        };
-        
-        Ok(QdrantPoint {
-            id: Uuid::new_v4().to_string(),
-            vector,
-            payload,
         })
     }
     
@@ -313,35 +285,33 @@ impl FormattedInput {
         }
     }
     
-    pub fn to_qdrant_json(&self) -> Result<String, FormatterError> {
-        serde_json::to_string_pretty(&self.qdrant_point)
-            .map_err(|e| FormatterError::SerializationFailed(e.to_string()))
+    pub fn to_sqlite_vec_record(&self) -> &SqliteVecRecord {
+        &self.sqlite_vec_record
     }
-    
-    pub fn to_json(&self) -> Result<String, FormatterError> {
+
+    pub fn to_engine_json(&self) -> Result<String, FormatterError> {
         serde_json::to_string_pretty(self)
             .map_err(|e| FormatterError::SerializationFailed(e.to_string()))
     }
-    
-    // Utility methods for Qdrant operations
+
     pub fn get_search_filters(&self) -> HashMap<String, serde_json::Value> {
         let mut filters = HashMap::new();
-        filters.insert("domain".to_string(), serde_json::Value::String(self.qdrant_point.payload.domain.clone()));
-        filters.insert("domain_category".to_string(), serde_json::Value::String(self.qdrant_point.payload.domain_category.clone()));
-        filters.insert("complexity_tier".to_string(), serde_json::Value::String(self.qdrant_point.payload.complexity_tier.clone()));
-        filters.insert("proficiency_level".to_string(), serde_json::Value::String(self.qdrant_point.payload.proficiency_level.clone()));
+        filters.insert("domain".to_string(), serde_json::Value::String(self.sqlite_vec_record.domain.clone()));
+        filters.insert("domain_category".to_string(), serde_json::Value::String(self.sqlite_vec_record.domain_category.clone()));
+        filters.insert("complexity_tier".to_string(), serde_json::Value::String(self.sqlite_vec_record.complexity_tier.clone()));
+        filters.insert("proficiency_level".to_string(), serde_json::Value::String(self.sqlite_vec_record.proficiency_level.clone()));
         filters
     }
-    
+
     pub fn get_id(&self) -> &str {
-        &self.qdrant_point.id
+        &self.sqlite_vec_record.id
     }
-    
+
     pub fn get_vector(&self) -> &Vec<f32> {
-        &self.qdrant_point.vector
+        &self.sqlite_vec_record.vector
     }
-    
-    pub fn get_payload(&self) -> &QdrantPayload {
-        &self.qdrant_point.payload
+
+    pub fn get_metadata(&self) -> &InputMetadata {
+        &self.metadata
     }
 }

@@ -44,6 +44,7 @@ aes-gcm = "0.10"
 flate2 = "1.0"
 rand_core = "0.6"
 toml = "0.5.4"
+lru = "0.10"
 
 [features]
 default = ["custom-protocol"]

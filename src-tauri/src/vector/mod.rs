@@ -5,7 +5,7 @@ pub mod query;
 pub mod embedding;
 pub mod security;
 
-pub use client::QdrantClient;
+pub use client::SqliteVecClient;
 pub use schema::*;
 pub use insert::*;
 pub use query::*;

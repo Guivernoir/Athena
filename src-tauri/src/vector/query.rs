@@ -1,14 +1,14 @@
-use crate::{QdrantClient, VectorDbError};
+use crate::{SqliteVecClient, VectorDbError};
 use crate::schema::{SearchResult, SearchFilters, SearchPayload};
-use qdrant_client::qdrant::{SearchPoints, ScoredPoint, Value};
 use std::sync::Arc;
+use sqlx::Row;
 
 pub struct VectorSearcher {
-    client: Arc<QdrantClient>,
+    client: Arc<SqliteVecClient>,
 }
 
 impl VectorSearcher {
-    pub fn new(client: Arc<QdrantClient>) -> Self {
+    pub fn new(client: Arc<SqliteVecClient>) -> Self {
         Self { client }
     }
     
@@ -19,186 +19,263 @@ impl VectorSearcher {
         filters: Option<SearchFilters>,
     ) -> Result<Vec<SearchResult>, VectorDbError> {
         // Validate vector dimensions
-        if query_vector.len() != self.client.get_vector_size() as usize {
+        if query_vector.len() != self.client.get_vector_size() {
             return Err(VectorDbError::InvalidVectorDimensions {
-                expected: self.client.get_vector_size() as usize,
+                expected: self.client.get_vector_size(),
                 actual: query_vector.len(),
             });
         }
+
+        let query_bytes = vector_to_bytes(&query_vector);
         
-        let search_points = SearchPoints {
-            collection_name: self.client.get_collection_name().to_string(),
-            vector: query_vector,
-            limit,
-            with_payload: Some(true.into()),
-            with_vectors: Some(true.into()),
-            filter: filters.and_then(|f| f.to_qdrant_filter()),
-            ..Default::default()
-        };
+        // Build the search query with filters
+        let (where_clause, bind_params) = self.build_filter_clause(filters);
         
-        let search_result = self.client
-            .get_client()
-            .search_points(&search_points)
+        let search_sql = format!(
+            r#"
+            SELECT 
+                t.id, t.raw_input, t.cleaned_input, t.action, t.domain, t.topic, t.mode,
+                t.proficiency, t.personality, t.word_count, t.sentence_count, t.token_preview,
+                t.complexity_score, t.estimated_processing_time, t.suggested_response_length,
+                t.domain_category, t.complexity_tier, t.proficiency_level, t.created_at,
+                t.vector, v.distance
+            FROM {} t
+            JOIN {}_vec_index v ON t.rowid = v.rowid
+            WHERE v.vector MATCH ? {}
+            ORDER BY v.distance
+            LIMIT ?
+            "#,
+            self.client.get_table_name(),
+            self.client.get_table_name(),
+            where_clause
+        );
+
+        let mut query = sqlx::query(&search_sql)
+            .bind(&query_bytes);
+
+        // Bind filter parameters
+        for param in bind_params {
+            query = query.bind(param);
+        }
+        
+        query = query.bind(limit as i64);
+
+        let rows = query
+            .fetch_all(self.client.get_pool())
             .await
             .map_err(|e| VectorDbError::QueryFailed(format!("Search failed: {}", e)))?;
-        
-        let results = search_result
-            .result
+
+        let results = rows
             .into_iter()
-            .map(|point| self.scored_point_to_search_result(point))
+            .map(|row| self.row_to_search_result(row))
             .collect::<Result<Vec<_>, _>>()?;
-        
+
         Ok(results)
     }
     
     pub async fn search_by_id(&self, id: &str) -> Result<Option<SearchResult>, VectorDbError> {
-        let get_points = qdrant_client::qdrant::GetPoints {
-            collection_name: self.client.get_collection_name().to_string(),
-            ids: vec![id.to_string().into()],
-            with_payload: Some(true.into()),
-            with_vectors: Some(true.into()),
-            ..Default::default()
-        };
-        
-        let get_result = self.client
-            .get_client()
-            .get_points(&get_points)
+        let query_sql = format!(
+            r#"
+            SELECT 
+                id, raw_input, cleaned_input, action, domain, topic, mode,
+                proficiency, personality, word_count, sentence_count, token_preview,
+                complexity_score, estimated_processing_time, suggested_response_length,
+                domain_category, complexity_tier, proficiency_level, created_at, vector
+            FROM {} WHERE id = ?
+            "#,
+            self.client.get_table_name()
+        );
+
+        let row = sqlx::query(&query_sql)
+            .bind(id)
+            .fetch_optional(self.client.get_pool())
             .await
             .map_err(|e| VectorDbError::QueryFailed(format!("Get by ID failed: {}", e)))?;
-        
-        if let Some(point) = get_result.result.into_iter().next() {
-            let scored_point = ScoredPoint {
-                id: point.id,
-                payload: point.payload,
-                vectors: point.vectors,
-                score: 1.0, // Perfect match since we're getting by ID
-            };
-            
-            Ok(Some(self.scored_point_to_search_result(scored_point)?))
+
+        if let Some(row) = row {
+            Ok(Some(self.row_to_search_result_with_score(row, 1.0)?))
         } else {
             Ok(None)
         }
     }
     
-    pub async fn search_with_scroll(
+    pub async fn search_with_pagination(
         &self,
         filters: Option<SearchFilters>,
         limit: u32,
-        offset: Option<String>,
-    ) -> Result<(Vec<SearchResult>, Option<String>), VectorDbError> {
-        let scroll_points = qdrant_client::qdrant::ScrollPoints {
-            collection_name: self.client.get_collection_name().to_string(),
-            filter: filters.and_then(|f| f.to_qdrant_filter()),
-            limit: Some(limit),
-            with_payload: Some(true.into()),
-            with_vectors: Some(true.into()),
-            offset: offset.map(|o| o.into()),
-            ..Default::default()
-        };
-        
-        let scroll_result = self.client
-            .get_client()
-            .scroll(&scroll_points)
-            .await
-            .map_err(|e| VectorDbError::QueryFailed(format!("Scroll failed: {}", e)))?;
-        
-        let results = scroll_result
-            .result
-            .into_iter()
-            .map(|point| {
-                let scored_point = ScoredPoint {
-                    id: point.id,
-                    payload: point.payload,
-                    vectors: point.vectors,
-                    score: 1.0, // No scoring in scroll
-                };
-                self.scored_point_to_search_result(scored_point)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        
-        let next_offset = scroll_result.next_page_offset.map(|o| o.to_string());
-        
-        Ok((results, next_offset))
-    }
-    
-    pub async fn count_points(&self, filters: Option<SearchFilters>) -> Result<u64, VectorDbError> {
-        let count_points = qdrant_client::qdrant::CountPoints {
-            collection_name: self.client.get_collection_name().to_string(),
-            filter: filters.and_then(|f| f.to_qdrant_filter()),
-            exact: Some(false), // Use approximate counting for performance
-            ..Default::default()
-        };
-        
-        let count_result = self.client
-            .get_client()
-            .count(&count_points)
-            .await
-            .map_err(|e| VectorDbError::QueryFailed(format!("Count failed: {}", e)))?;
-        
-        Ok(count_result.result.map(|r| r.count).unwrap_or(0))
-    }
-    
-    pub async fn search_recommendations(
-        &self,
-        positive_ids: Vec<String>,
-        negative_ids: Vec<String>,
-        limit: u64,
-        filters: Option<SearchFilters>,
+        offset: u32,
     ) -> Result<Vec<SearchResult>, VectorDbError> {
-        let recommend_points = qdrant_client::qdrant::RecommendPoints {
-            collection_name: self.client.get_collection_name().to_string(),
-            positive: positive_ids.into_iter().map(|id| id.into()).collect(),
-            negative: negative_ids.into_iter().map(|id| id.into()).collect(),
-            limit,
-            with_payload: Some(true.into()),
-            with_vectors: Some(true.into()),
-            filter: filters.and_then(|f| f.to_qdrant_filter()),
-            ..Default::default()
-        };
+        let (where_clause, bind_params) = self.build_filter_clause(filters);
         
-        let recommend_result = self.client
-            .get_client()
-            .recommend(&recommend_points)
+        let query_sql = format!(
+            r#"
+            SELECT 
+                id, raw_input, cleaned_input, action, domain, topic, mode,
+                proficiency, personality, word_count, sentence_count, token_preview,
+                complexity_score, estimated_processing_time, suggested_response_length,
+                domain_category, complexity_tier, proficiency_level, created_at, vector
+            FROM {} 
+            {} 
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            "#,
+            self.client.get_table_name(),
+            if where_clause.is_empty() { "" } else { &format!("WHERE {}", &where_clause[4..]) }
+        );
+
+        let mut query = sqlx::query(&query_sql);
+
+        // Bind filter parameters
+        for param in bind_params {
+            query = query.bind(param);
+        }
+        
+        query = query.bind(limit as i64).bind(offset as i64);
+
+        let rows = query
+            .fetch_all(self.client.get_pool())
             .await
-            .map_err(|e| VectorDbError::QueryFailed(format!("Recommend failed: {}", e)))?;
-        
-        let results = recommend_result
-            .result
+            .map_err(|e| VectorDbError::QueryFailed(format!("Pagination search failed: {}", e)))?;
+
+        let results = rows
             .into_iter()
-            .map(|point| self.scored_point_to_search_result(point))
+            .map(|row| self.row_to_search_result_with_score(row, 1.0))
             .collect::<Result<Vec<_>, _>>()?;
-        
+
         Ok(results)
     }
     
-    fn scored_point_to_search_result(
-        &self,
-        point: ScoredPoint,
-    ) -> Result<SearchResult, VectorDbError> {
-        // Convert the payload to SearchPayload if needed
-        let payload = point
-            .payload
-            .map(|p| SearchPayload::from_qdrant_payload(p))
-            .transpose()?;
+    pub async fn count_points(&self, filters: Option<SearchFilters>) -> Result<u64, VectorDbError> {
+        let (where_clause, bind_params) = self.build_filter_clause(filters);
+        
+        let count_sql = format!(
+            "SELECT COUNT(*) as count FROM {} {}",
+            self.client.get_table_name(),
+            if where_clause.is_empty() { "" } else { &format!("WHERE {}", &where_clause[4..]) }
+        );
 
-        // Extract vector(s)
-        let vector = match point.vectors {
-            Some(qdrant_client::qdrant::vectors::Vectors::Vector(v)) => Some(v.data),
-            Some(qdrant_client::qdrant::vectors::Vectors::VectorsMap(mut map)) => {
-                // If there are multiple named vectors, pick the first one
-                map.values_mut().next().map(|v| v.data.clone())
+        let mut query = sqlx::query(&count_sql);
+
+        // Bind filter parameters
+        for param in bind_params {
+            query = query.bind(param);
+        }
+
+        let row = query
+            .fetch_one(self.client.get_pool())
+            .await
+            .map_err(|e| VectorDbError::QueryFailed(format!("Count failed: {}", e)))?;
+
+        Ok(row.get::<i64, _>("count") as u64)
+    }
+    
+    fn build_filter_clause(&self, filters: Option<SearchFilters>) -> (String, Vec<String>) {
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+
+        if let Some(filters) = filters {
+            if let Some(domain) = filters.domain {
+                conditions.push("t.domain = ?".to_string());
+                params.push(domain);
             }
-            None => None,
+            
+            if let Some(category) = filters.domain_category {
+                conditions.push("t.domain_category = ?".to_string());
+                params.push(category);
+            }
+            
+            if let Some(tier) = filters.complexity_tier {
+                conditions.push("t.complexity_tier = ?".to_string());
+                params.push(tier);
+            }
+            
+            if let Some(level) = filters.proficiency_level {
+                conditions.push("t.proficiency_level = ?".to_string());
+                params.push(level);
+            }
+            
+            if let Some(mode) = filters.mode {
+                conditions.push("t.mode = ?".to_string());
+                params.push(mode);
+            }
+            
+            if let Some(personality) = filters.personality {
+                conditions.push("t.personality = ?".to_string());
+                params.push(personality);
+            }
+            
+            if let (Some(min), Some(max)) = (filters.min_complexity, filters.max_complexity) {
+                conditions.push("t.complexity_score BETWEEN ? AND ?".to_string());
+                params.push(min.to_string());
+                params.push(max.to_string());
+            }
+            
+            if let Some(after) = filters.created_after {
+                conditions.push("t.created_at > ?".to_string());
+                params.push(after.to_string());
+            }
+            
+            if let Some(before) = filters.created_before {
+                conditions.push("t.created_at < ?".to_string());
+                params.push(before.to_string());
+            }
+        }
+
+        if conditions.is_empty() {
+            ("".to_string(), params)
+        } else {
+            (format!("AND {}", conditions.join(" AND ")), params)
+        }
+    }
+    
+    fn row_to_search_result(&self, row: sqlx::sqlite::SqliteRow) -> Result<SearchResult, VectorDbError> {
+        let distance: f32 = row.get("distance");
+        let score = 1.0 - distance; // Convert distance to similarity score
+        
+        self.row_to_search_result_with_score(row, score)
+    }
+    
+    fn row_to_search_result_with_score(&self, row: sqlx::sqlite::SqliteRow, score: f32) -> Result<SearchResult, VectorDbError> {
+        let vector_bytes: Vec<u8> = row.get("vector");
+        let vector = bytes_to_vector(&vector_bytes);
+        
+        let payload = SearchPayload {
+            raw_input: row.get("raw_input"),
+            cleaned_input: row.get("cleaned_input"),
+            action: row.get("action"),
+            domain: row.get("domain"),
+            topic: row.get("topic"),
+            mode: row.get("mode"),
+            proficiency: row.get("proficiency"),
+            personality: row.get("personality"),
+            complexity_score: row.get("complexity_score"),
+            domain_category: row.get("domain_category"),
+            complexity_tier: row.get("complexity_tier"),
+            proficiency_level: row.get("proficiency_level"),
+            created_at: row.get("created_at"),
         };
 
         Ok(SearchResult {
-            id: match point.id {
-                qdrant_client::qdrant::point_id::PointIdOptions::Uuid(uuid) => uuid,
-                qdrant_client::qdrant::point_id::PointIdOptions::Num(num) => num.to_string(),
-            },
-            score: point.score,
+            id: row.get("id"),
+            score,
             vector,
             payload,
         })
     }
+}
+
+// Helper functions for vector conversion
+fn vector_to_bytes(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for &value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn bytes_to_vector(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }

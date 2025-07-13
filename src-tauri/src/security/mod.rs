@@ -1,6 +1,6 @@
 mod encryption;
 mod compression;
-mod quantizer;
+pub mod quantizer;
 
 pub use encryption::{encrypt_data, decrypt_data, generate_key};
 pub use compression::{compress_data, decompress_data};

@@ -1,109 +1,146 @@
-use qdrant_client::{
-    client::QdrantClient as QdrantClientInner,
-    qdrant::{
-        CreateCollection, Distance, VectorParams, VectorsConfig,
-        CollectionOperationResponse, GetCollectionInfoRequest
-    },
-};
+use sqlx::{SqlitePool, sqlite::SqlitePoolOptions, Row};
 use tokio::sync::OnceCell;
 use std::sync::Arc;
 use crate::VectorDbError;
 
-static QDRANT_CLIENT: OnceCell<Arc<QdrantClient>> = OnceCell::const_new();
+static SQLITE_CLIENT: OnceCell<Arc<SqliteVecClient>> = OnceCell::const_new();
 
-pub struct QdrantClient {
-    client: QdrantClientInner,
-    collection_name: String,
-    vector_size: u64,
+pub struct SqliteVecClient {
+    pool: SqlitePool,
+    table_name: String,
+    vector_size: usize,
 }
 
-impl QdrantClient {
+impl SqliteVecClient {
     pub async fn new(
-        url: &str,
-        collection_name: String,
-        vector_size: u64,
+        db_path: &str,
+        table_name: String,
+        vector_size: usize,
     ) -> Result<Self, VectorDbError> {
-        let client = QdrantClientInner::from_url(url)
-            .build()
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&format!("sqlite:{}", db_path))
+            .await
             .map_err(|e| VectorDbError::ConnectionFailed(e.to_string()))?;
         
-        let qdrant_client = Self {
-            client,
-            collection_name,
+        let client = Self {
+            pool,
+            table_name,
             vector_size,
         };
         
-        // Ensure collection exists
-        qdrant_client.ensure_collection().await?;
+        // Initialize the database schema
+        client.ensure_schema().await?;
         
-        Ok(qdrant_client)
+        Ok(client)
     }
     
     pub async fn global(
-        url: &str,
-        collection_name: String,
-        vector_size: u64,
+        db_path: &str,
+        table_name: String,
+        vector_size: usize,
     ) -> Result<Arc<Self>, VectorDbError> {
-        QDRANT_CLIENT.get_or_try_init(|| async {
-            let client = Self::new(url, collection_name, vector_size).await?;
+        SQLITE_CLIENT.get_or_try_init(|| async {
+            let client = Self::new(db_path, table_name, vector_size).await?;
             Ok(Arc::new(client))
         }).await.map(|c| c.clone())
     }
     
-    async fn ensure_collection(&self) -> Result<(), VectorDbError> {
-        // Check if collection exists
-        match self.client.get_collection_info(&self.collection_name).await {
-            Ok(_) => {
-                // Collection exists, validate vector size
-                // Note: In a real implementation, you'd check the actual vector config
-                Ok(())
-            }
-            Err(_) => {
-                // Collection doesn't exist, create it
-                self.create_collection().await
-            }
-        }
-    }
-    
-    async fn create_collection(&self) -> Result<(), VectorDbError> {
-        let create_collection = CreateCollection {
-            collection_name: self.collection_name.clone(),
-            vectors_config: Some(VectorsConfig {
-                config: Some(qdrant_client::qdrant::vectors_config::Config::Params(
-                    VectorParams {
-                        size: self.vector_size,
-                        distance: Distance::Cosine.into(),
-                        ..Default::default()
-                    }
-                ))
-            }),
-            ..Default::default()
-        };
-        
-        self.client
-            .create_collection(&create_collection)
+    async fn ensure_schema(&self) -> Result<(), VectorDbError> {
+        // Load sqlite-vec extension
+        sqlx::query("SELECT load_extension('vec0')")
+            .execute(&self.pool)
             .await
-            .map_err(|e| VectorDbError::ConnectionFailed(format!("Failed to create collection: {}", e)))?;
+            .map_err(|e| VectorDbError::ConnectionFailed(format!("Failed to load vec0 extension: {}", e)))?;
+        
+        // Create the main table with vector column
+        let create_table_sql = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id TEXT PRIMARY KEY,
+                vector BLOB,
+                raw_input TEXT NOT NULL,
+                cleaned_input TEXT NOT NULL,
+                action TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                proficiency TEXT NOT NULL,
+                personality TEXT NOT NULL,
+                word_count INTEGER NOT NULL,
+                sentence_count INTEGER NOT NULL,
+                token_preview TEXT NOT NULL,
+                complexity_score REAL NOT NULL,
+                estimated_processing_time INTEGER NOT NULL,
+                suggested_response_length TEXT NOT NULL,
+                domain_category TEXT NOT NULL,
+                complexity_tier TEXT NOT NULL,
+                proficiency_level TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                secured_vector BLOB
+            )
+            "#,
+            self.table_name
+        );
+        
+        sqlx::query(&create_table_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| VectorDbError::ConnectionFailed(format!("Failed to create table: {}", e)))?;
+        
+        // Create vector index for similarity search
+        let create_index_sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {}_vec_index USING vec0(
+                vector float[{}] distance_metric=cosine
+            )
+            "#,
+            self.table_name, self.vector_size
+        );
+        
+        sqlx::query(&create_index_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| VectorDbError::ConnectionFailed(format!("Failed to create vector index: {}", e)))?;
         
         Ok(())
     }
     
-    pub fn get_client(&self) -> &QdrantClientInner {
-        &self.client
+    pub fn get_pool(&self) -> &SqlitePool {
+        &self.pool
     }
     
-    pub fn get_collection_name(&self) -> &str {
-        &self.collection_name
+    pub fn get_table_name(&self) -> &str {
+        &self.table_name
     }
     
-    pub fn get_vector_size(&self) -> u64 {
+    pub fn get_vector_size(&self) -> usize {
         self.vector_size
     }
     
-    pub async fn collection_info(&self) -> Result<qdrant_client::qdrant::CollectionInfo, VectorDbError> {
-        self.client
-            .get_collection_info(&self.collection_name)
+    pub async fn table_info(&self) -> Result<Vec<String>, VectorDbError> {
+        let query = format!("PRAGMA table_info({})", self.table_name);
+        let rows = sqlx::query(&query)
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| VectorDbError::QueryFailed(format!("Failed to get collection info: {}", e)))
+            .map_err(|e| VectorDbError::QueryFailed(format!("Failed to get table info: {}", e)))?;
+        
+        let columns: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        
+        Ok(columns)
+    }
+    
+    pub async fn count_vectors(&self) -> Result<i64, VectorDbError> {
+        let query = format!("SELECT COUNT(*) as count FROM {}", self.table_name);
+        let row = sqlx::query(&query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| VectorDbError::QueryFailed(format!("Failed to count vectors: {}", e)))?;
+        
+        Ok(row.get("count"))
     }
 }

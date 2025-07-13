@@ -1,4 +1,3 @@
-// Because hardcoded strings are the enemy of global domination
 const additionalTranslations = {
   en: {
     // Welcome screen specific
