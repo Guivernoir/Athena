@@ -10,7 +10,7 @@
 │   ├── score.rs
 │   └── tests.rs
 ├── commands.rs
-├── embedding $$
+├── embedding
 │   ├── engine.cpp
 │   ├── engine.hpp
 │   ├── ffi.rs
@@ -50,7 +50,7 @@
 │   ├── traits.rs
 │   └── types.rs
 ├── lib.rs
-├── llama      $$
+├── llama
 │   ├── engine.cpp
 │   ├── engine.hpp
 │   ├── ffi.rs
@@ -68,14 +68,23 @@
 │   ├── search.rs
 │   ├── store.rs
 │   └── tests.rs
-├── personalities &&
+├── personalities
 │   ├── Aurora.toml
 │   ├── Ekaterina.toml
 │   ├── Erika.toml
 │   ├── mod.rs
 │   └── Viktor.toml
 ├── postprocessing
-├── preprocessing $$
+│   ├── Architecture.md
+│   ├── formatter.rs
+│   ├── interpreter.rs
+│   ├── mod.rs
+│   ├── persona.rs
+│   ├── templates.rs
+│   ├── tests.rs
+│   ├── traits.rs
+│   └── validator.rs
+├── preprocessing
 │   ├── Architecture.md
 │   ├── cleaner.rs
 │   ├── context.rs
@@ -83,7 +92,7 @@
 │   ├── mod.rs
 │   ├── router.rs
 │   └── tokenizer.rs
-├── security           $$
+├── security
 │   ├── compression.rs
 │   ├── encryption.rs
 │   ├── mod.rs
