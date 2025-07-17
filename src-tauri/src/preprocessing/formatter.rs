@@ -72,6 +72,7 @@ impl FormattedInput {
         mode: Mode,
         proficiency: Proficiency,
         personality: Personality,
+        language: Language,
         vector: Vec<f32>,
     ) -> Result<Self, FormatterError> {
         let metadata = Self::calculate_metadata(&context, &tokens, &proficiency);

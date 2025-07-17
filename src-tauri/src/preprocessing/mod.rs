@@ -4,7 +4,7 @@ pub mod cleaner;
 pub mod tokenizer;
 pub mod formatter;
 
-pub use router::{Mode, Proficiency, Personality};
+pub use router::{Mode, Proficiency, Personality, Language};
 pub use context::{Context, ContextError};
 pub use cleaner::{Cleaner, CleanerError};
 pub use tokenizer::{Tokenizer, TokenizerError};
@@ -32,12 +32,13 @@ impl Preprocessor {
         mode: Mode,
         proficiency: Proficiency,
         personality: Personality,
+        language: Language,
         llm: &crate::llama::LLMEngine,
     ) -> Result<FormattedInput, PreprocessorError> {
         let cleaned = Cleaner::clean(&input)?;
         let context = Context::analyze(cleaned.clone(), llm).await?;
         let tokens = Tokenizer::tokenize(&cleaned)?;
-        let formatted = FormattedInput::new(context, tokens, mode, proficiency, personality)?;
+        let formatted = FormattedInput::new(context, tokens, mode, proficiency, personality, language)?;
         
         Ok(formatted)
     }

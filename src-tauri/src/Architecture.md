@@ -1,30 +1,56 @@
 .
 ├── Architecture.md
+├── cache
+│   ├── Architecture.md
+│   ├── embedder.rs
+│   ├── flusher.rs
+│   ├── manager.rs
+│   ├── message.rs
+│   ├── mod.rs
+│   ├── score.rs
+│   └── tests.rs
 ├── commands.rs
+├── embedding $$
+│   ├── engine.cpp
+│   ├── engine.hpp
+│   ├── ffi.rs
+│   ├── models
+│   │   └── bge-small-en-v1.5-q8_0.gguf
+│   └── mod.rs
 ├── engine
 │   ├── Architecture.md
-│   ├── cache
-│   │   ├── memory.rs
-│   │   ├── mod.rs
-│   │   └── storage.rs
 │   ├── core.rs
-│   ├── ffi
-│   │   ├── engine.cpp
-│   │   ├── engine.hpp
-│   │   └── mod.rs
 │   ├── mod.rs
+│   ├── orchestrator.rs
 │   ├── output
+│   │   ├── Architecture.md
 │   │   ├── builder.rs
 │   │   ├── formatter.rs
-│   │   └── mod.rs
-│   ├── processor.rs
-│   └── retrieval
-│   ├── db.rs
-│   ├── merger.rs
-│   ├── mod.rs
-│   └── ws.rs
+│   │   ├── injector.rs
+│   │   ├── mod.rs
+│   │   ├── schema.rs
+│   │   ├── templates.rs
+│   │   ├── tests.rs
+│   │   └── traits.rs
+│   ├── retrieval
+│   │   ├── Architecture.md
+│   │   ├── merger.rs
+│   │   ├── mod.rs
+│   │   ├── query.rs
+│   │   ├── result.rs
+│   │   ├── router.rs
+│   │   ├── scorer.rs
+│   │   ├── sources
+│   │   │   ├── cache.rs
+│   │   │   ├── memory.rs
+│   │   │   ├── mod.rs
+│   │   │   └── web.rs
+│   │   └── tests.rs
+│   ├── tests.rs
+│   ├── traits.rs
+│   └── types.rs
 ├── lib.rs
-├── llama
+├── llama      $$
 │   ├── engine.cpp
 │   ├── engine.hpp
 │   ├── ffi.rs
@@ -32,17 +58,24 @@
 │   │   └── qwen2.5-0.5b-instruct-q5_k_m.gguf
 │   └── mod.rs
 ├── main.rs
-├── personalities
+├── memory
+│   ├── Architecture.md
+│   ├── index.rs
+│   ├── io.rs
+│   ├── layout.rs
+│   ├── mod.rs
+│   ├── record.rs
+│   ├── search.rs
+│   ├── store.rs
+│   └── tests.rs
+├── personalities &&
 │   ├── Aurora.toml
 │   ├── Ekaterina.toml
 │   ├── Erika.toml
 │   ├── mod.rs
 │   └── Viktor.toml
 ├── postprocessing
-│   ├── context.rs
-│   ├── mod.rs
-│   └── persona.rs
-├── preprocessing
+├── preprocessing $$
 │   ├── Architecture.md
 │   ├── cleaner.rs
 │   ├── context.rs
@@ -50,7 +83,7 @@
 │   ├── mod.rs
 │   ├── router.rs
 │   └── tokenizer.rs
-├── security
+├── security           $$
 │   ├── compression.rs
 │   ├── encryption.rs
 │   ├── mod.rs
@@ -64,18 +97,5 @@
 │   │   ├── quantizer.cpp
 │   │   └── quantizer.hpp
 │   └── mod.rs
-└── vector
-├── Architecture.md
-├── client.rs
-├── embedding
-│   ├── engine.cpp
-│   ├── engine.hpp
-│   ├── ffi.rs
-│   ├── models
-│   │   └── bge-small-en-v1.5-q8_0.gguf
-│   └── mod.rs
-├── insert.rs
-├── mod.rs
-├── query.rs
-├── schema.rs
-└── transformation.rs
+├── test2.txt
+└── test.txt

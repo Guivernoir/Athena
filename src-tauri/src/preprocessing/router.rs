@@ -24,7 +24,7 @@ pub enum Personality{
 }
 
 impl Mode{
-    pub async fn select_mode(mode: u32) -> Result<Self, String> {
+    pub async fn select_mode(mode: u8) -> Result<Self, String> {
         match mode {
             0 => Ok(Mode::Tutor),
             1 => Ok(Mode::Assistant),
@@ -34,7 +34,7 @@ impl Mode{
 }
 
 impl Proficiency{
-    pub async fn select_proficiency(proficiency: u32) -> Result<Self, String>{
+    pub async fn select_proficiency(proficiency: u8) -> Result<Self, String>{
         match proficiency {
             0 => Ok(Proficiency::Beginner),
             1 => Ok(Proficiency::Intermediate),
@@ -46,7 +46,7 @@ impl Proficiency{
 }
 
 impl Personality{
-    pub async fn select_personality(personality: u32) -> Result<Self, String>{
+    pub async fn select_personality(personality: u8) -> Result<Self, String>{
         match personality{
             0 => Ok(Personality::Erika),
             1 => Ok(Personality::Aurora),
