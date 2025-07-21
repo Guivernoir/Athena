@@ -3,9 +3,7 @@
 // iOS 13+, Android API 24+, static OpenMP, ≤ 5 MB binary
 
 #include "faiss_wrapper.hpp"
-#include <faiss/IndexFlat.h>
 #include <faiss/IndexPQ.h>
-#include <faiss/impl/ProductQuantizer.h>
 #include <cstring>
 #include <memory>
 #include <omp.h>
@@ -120,66 +118,3 @@ extern "C"
     }
 
 } // extern "C"
-
-// faiss_wrapper.hpp 
-// Unified C-API header for FAISS Product Quantization
-// Compatible with iOS 13+, Android API 24+, static OpenMP
-#pragma once
-#include <stddef.h>
-#include <stdint.h>
-
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-
-    // Opaque handle
-    typedef struct FaissContext faiss_context_t;
-
-    // Create / destroy
-    faiss_context_t *faiss_create(int d); // dimension ≤ 1024, multiple of 48
-    void faiss_free(faiss_context_t *ctx);
-
-    // Training
-    int faiss_train(faiss_context_t *ctx,
-                    const float *vectors,
-                    size_t n_vectors);
-
-    // Single-vector encode/decode
-    // Returns number of bytes written (always 48)
-    size_t faiss_encode(faiss_context_t *ctx,
-                        const float *vector,
-                        uint8_t *out_codes);
-
-    // Returns number of floats written (dimension)
-    size_t faiss_decode(faiss_context_t *ctx,
-                        const uint8_t *codes,
-                        float *out_vector);
-
-    // Thread-pool tuning
-    void faiss_set_omp_num_threads(int n);
-    int faiss_get_omp_max_threads();
-
-#ifdef __cplusplus
-}
-#endif
-
-// CMakeLists.txt 
-cmake_minimum_required(VERSION 3.16)
-project(faiss_wrapper)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
-
-# FAISS static
-find_package(faiss REQUIRED CONFIG)
-
-# OpenMP (static)
-find_package(OpenMP REQUIRED)
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_CXX_FLAGS}")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${OpenMP_CXX_FLAGS}")
-
-add_library(faiss_wrapper STATIC faiss_wrapper.cpp)
-target_link_libraries(faiss_wrapper PRIVATE faiss OpenMP::OpenMP_CXX)
-target_compile_definitions(faiss_wrapper PRIVATE FAISS_USE_FLOAT=1)
