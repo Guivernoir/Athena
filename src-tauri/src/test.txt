@@ -1,1892 +1,241 @@
-// mod.rs 
-// mod.rs
-//! State-of-art public API for quantization.
-//! Single-call `quantize` / `dequantize` with optional preprocessing.
+//! State-of-art, zero-copy bit-packing utilities.
+//! Always inline, SIMD-ready, ≤ 5 KB public surface.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-pub use crate::types::{Vector, QuantizedVector, Codebook, BitWidth, B8, B4};
-pub use crate::types::{PreprocessError as ValidationError, TrainError, EncodeError, DecodeError};
-
-use crate::preprocessor::{Preprocessor, L2Norm, MeanCenter};
-use crate::encoder::{PqEncoder, DecodeError as EncError};
-use crate::decoder::{PqDecoder, DecodeError as DecError};
-use crate::trainer::{KMeans, InitMethod, DistanceMetric, EmptyClusterAction};
-
-use core::marker::PhantomData;
+use crate::errors::CompressionError;
 use alloc::vec::Vec;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use core::mem;
 
 // ------------------------------------------------------------------
-// Unified error
-// ------------------------------------------------------------------
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum QuantizeError {
-    Encode(EncError),
-    Decode(DecError),
-    Train(TrainError),
-    Validation(ValidationError),
-}
-
-impl From<EncError> for QuantizeError { fn from(e: EncError) -> Self { Self::Encode(e) } }
-impl From<DecError> for QuantizeError { fn from(e: DecError) -> Self { Self::Decode(e) } }
-impl From<TrainError> for QuantizeError { fn from(e: TrainError) -> Self { Self::Train(e) } }
-impl From<ValidationError> for QuantizeError { fn from(e: ValidationError) -> Self { Self::Validation(e) } }
-
-// ------------------------------------------------------------------
-// Default pipeline
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Quantizer<const D: usize, const M: usize, B: BitWidth = B8> {
-    preprocessor: Preprocessor<D>,
-    encoder: PqEncoder<D, M, B>,
-    decoder: PqDecoder<D, M, B>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> Quantizer<D, M, B> {
-    /// Ready-to-use quantizer with default preprocessing (L2 + mean-center).
-    #[inline(always)]
-    pub fn new(codebook: Codebook<D, M, B>) -> Self {
-        let encoder = PqEncoder::new(codebook.clone());
-        let decoder = PqDecoder::new(codebook);
-        Self {
-            preprocessor: Preprocessor::<D>::new()
-                .l2_normalize(true)
-                .mean_center(true),
-            encoder,
-            decoder,
-        }
-    }
-
-    /// Single-call quantize.
-    #[inline(always)]
-    pub fn quantize(&self, v: &Vector<D>) -> Result<QuantizedVector<M>, QuantizeError> {
-        let prepped = self.preprocessor.apply(v);
-        Ok(self.encoder.encode(&prepped))
-    }
-
-    /// Single-call dequantize.
-    #[inline(always)]
-    pub fn dequantize(&self, q: &QuantizedVector<M>) -> Result<Vector<D>, QuantizeError> {
-        Ok(self.decoder.decode(q))
-    }
-
-    /// Batch helpers.
-    #[inline(always)]
-    pub fn quantize_batch(&self, batch: &[Vector<D>]) -> Result<Vec<QuantizedVector<M>>, QuantizeError> {
-        batch.iter().map(|v| self.quantize(v)).collect()
-    }
-
-    #[inline(always)]
-    pub fn dequantize_batch(&self, codes: &[QuantizedVector<M>]) -> Result<Vec<Vector<D>>, QuantizeError> {
-        codes.iter().map(|q| self.dequantize(q)).collect()
-    }
-}
-
-// ------------------------------------------------------------------
-// Builder for power users
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct QuantizerBuilder<const D: usize, const M: usize, B: BitWidth = B8> {
-    init: InitMethod,
-    max_iters: usize,
-    tolerance: Scalar,
-    metric: DistanceMetric,
-    empty_action: EmptyClusterAction,
-    l2_norm: bool,
-    mean_center: bool,
-    _marker: PhantomData<B>,
-}
-type Scalar = crate::types::Scalar;
-
-impl<const D: usize, const M: usize, B: BitWidth> QuantizerBuilder<D, M, B> {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline(always)]
-    pub fn init(mut self, method: InitMethod) -> Self {
-        self.init = method;
-        self
-    }
-
-    #[inline(always)]
-    pub fn max_iters(mut self, iters: usize) -> Self {
-        self.max_iters = iters;
-        self
-    }
-
-    #[inline(always)]
-    pub fn tolerance(mut self, tol: Scalar) -> Self {
-        self.tolerance = tol;
-        self
-    }
-
-    #[inline(always)]
-    pub fn metric(mut self, m: DistanceMetric) -> Self {
-        self.metric = m;
-        self
-    }
-
-    #[inline(always)]
-    pub fn empty_action(mut self, action: EmptyClusterAction) -> Self {
-        self.empty_action = action;
-        self
-    }
-
-    #[inline(always)]
-    pub fn l2_norm(mut self, enable: bool) -> Self {
-        self.l2_norm = enable;
-        self
-    }
-
-    #[inline(always)]
-    pub fn mean_center(mut self, enable: bool) -> Self {
-        self.mean_center = enable;
-        self
-    }
-
-    /// Train codebook then build quantizer.
-    #[inline(always)]
-    pub fn fit(self, data: &[Vector<D>]) -> Result<Quantizer<D, M, B>, QuantizeError> {
-        let kmeans = KMeans::<D, 1usize << B::BITS>::builder()
-            .init(self.init)
-            .max_iters(self.max_iters)
-            .tolerance(self.tolerance)
-            .metric(self.metric)
-            .empty_action(self.empty_action)
-            .build();
-        let codebook = kmeans.fit(data)?;
-        Ok(Quantizer::new(codebook))
-    }
-}
-
-// ------------------------------------------------------------------
-// Runtime helpers
+// 1. Scalar helpers (always present)
 // ------------------------------------------------------------------
 #[inline(always)]
-pub fn quantize_runtime(
-    data: &[Scalar],
-    d: usize,
-    m: usize,
-    centroids: &[[Scalar]],
-) -> Result<Vec<u8>, QuantizeError> {
-    if d % m != 0 || centroids.len() != 256 {
-        return Err(QuantizeError::Validation(ValidationError::DimMismatch));
+pub fn bit_mask(bits: u8) -> u32 {
+    (1u32 << bits).wrapping_sub(1)
+}
+
+#[inline(always)]
+pub fn bit_count(mut v: u32) -> u8 {
+    v.count_ones() as u8
+}
+
+// ------------------------------------------------------------------
+// 2. Runtime bit-width pack/unpack (LSB-first, 1–8 bits)
+// ------------------------------------------------------------------
+/// Pack `src` into a `Vec<u8>` using `bits` per element.
+/// Returns `Ok(bytes)` or `Err(CompressionError)` on overflow / invalid `bits`.
+#[inline(always)]
+pub fn pack_bits(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
+    if bits == 0 || bits > 8 {
+        return Err(CompressionError::BitWidthUnsupported { bits });
     }
-    let mut out = vec![0u8; m * (data.len() / d)];
-    let sub_dim = d / m;
-    for (chunk_idx, chunk) in data.chunks_exact(d).enumerate() {
-        for m_idx in 0..m {
-            let mut best = 0usize;
-            let mut best_dist = Scalar::MAX;
-            let start = m_idx * sub_dim;
-            let sub_vec = &chunk[start..start + sub_dim];
-            for (k, centroid) in centroids.iter().enumerate() {
-                let mut dist = 0.0;
-                for (a, &b) in sub_vec.iter().zip(centroid.iter()) {
-                    let d = a - b;
-                    dist += d * d;
-                }
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = k;
-                }
-            }
-            out[chunk_idx * m + m_idx] = best as u8;
+    let total_bits = src.len().checked_mul(bits as usize)
+        .ok_or(CompressionError::Overflow)?;
+    let byte_len = (total_bits + 7) / 8;
+    let mut out = Vec::with_capacity(byte_len);
+
+    let mut buf = 0u64;
+    let mut bits_left = 64;
+
+    for &val in src {
+        if val > bit_mask(bits) {
+            return Err(CompressionError::Overflow);
         }
+        let mut v = val;
+        let mut rem = bits;
+        loop {
+            let take = rem.min(bits_left);
+            buf |= (v & bit_mask(take)) << (64 - bits_left);
+            v >>= take;
+            bits_left -= take;
+            rem -= take;
+            if bits_left == 0 {
+                out.extend_from_slice(&buf.to_le_bytes());
+                buf = 0;
+                bits_left = 64;
+            }
+            if rem == 0 { break; }
+        }
+    }
+    if bits_left < 64 {
+        let bytes = (64 - bits_left + 7) / 8;
+        out.extend_from_slice(&buf.to_le_bytes()[..bytes as usize]);
     }
     Ok(out)
 }
 
+/// Unpack `bytes` into `Vec<u32>` assuming `bits` per element.
 #[inline(always)]
-pub fn dequantize_runtime(
-    codes: &[u8],
-    d: usize,
-    m: usize,
-    centroids: &[[Scalar]],
-) -> Result<Vec<Scalar>, QuantizeError> {
-    if d % m != 0 || centroids.len() != 256 {
-        return Err(QuantizeError::Validation(ValidationError::DimMismatch));
+pub fn unpack_bits(bytes: &[u8], bits: u8, len: usize) -> Result<Vec<u32>, CompressionError> {
+    if bits == 0 || bits > 8 {
+        return Err(CompressionError::BitWidthUnsupported { bits });
     }
-    let sub_dim = d / m;
-    let mut out = vec![0.0; codes.len() / m * d];
-    for (chunk_idx, chunk) in codes.chunks_exact(m).enumerate() {
-        for (m_idx, &idx) in chunk.iter().enumerate() {
-            let centroid = &centroids[idx as usize];
-            let offset = chunk_idx * d + m_idx * sub_dim;
-            out[offset..offset + sub_dim].copy_from_slice(centroid);
-        }
+    let total_bits = len.checked_mul(bits as usize)
+        .ok_or(CompressionError::Overflow)?;
+    if total_bits > bytes.len() * 8 {
+        return Err(CompressionError::InvalidLength);
+    }
+
+    let mut out = Vec::with_capacity(len);
+    let mut reader = BitReader::new(bytes);
+    for _ in 0..len {
+        let val = reader.read_bits(bits).ok_or(CompressionError::Overflow)?;
+        out.push(val);
     }
     Ok(out)
 }
 
 // ------------------------------------------------------------------
-// FFI bridge
+// 3. BitReader (scalar fallback, SIMD-ready)
 // ------------------------------------------------------------------
-#[cfg(feature = "ffi")]
-mod ffi {
-    use super::*;
-    use core::ffi::{c_float, c_uchar};
-
-    #[no_mangle]
-    pub unsafe extern "C" fn quantize_raw(
-        data: *const c_float,
-        len: usize,
-        d: usize,
-        m: usize,
-        centroids: *const *const c_float,
-        centroids_len: usize,
-        out: *mut c_uchar,
-    ) -> c_uchar {
-        if len % d != 0 || centroids_len != 256 {
-            return 1;
-        }
-        let data_slice = core::slice::from_raw_parts(data, len);
-        let centroids_slice = (0..256)
-            .map(|i| {
-                core::slice::from_raw_parts(
-                    *centroids.add(i),
-                    d / m,
-                )
-            })
-            .collect::<Vec<_>>();
-        match quantize_runtime(data_slice, d, m, &centroids_slice) {
-            Ok(bytes) => {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
-                0
-            }
-            Err(_) => 1,
-        }
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn dequantize_raw(
-        codes: *const c_uchar,
-        len: usize,
-        d: usize,
-        m: usize,
-        centroids: *const *const c_float,
-        centroids_len: usize,
-        out: *mut c_float,
-    ) -> c_uchar {
-        if len % m != 0 || centroids_len != 256 {
-            return 1;
-        }
-        let codes_slice = core::slice::from_raw_parts(codes, len);
-        let centroids_slice = (0..256)
-            .map(|i| {
-                core::slice::from_raw_parts(
-                    *centroids.add(i),
-                    d / m,
-                )
-            })
-            .collect::<Vec<_>>();
-        match dequantize_runtime(codes_slice, d, m, &centroids_slice) {
-            Ok(vec) => {
-                core::ptr::copy_nonoverlapping(vec.as_ptr(), out, vec.len());
-                0
-            }
-            Err(_) => 1,
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// Convenience exports
-// ------------------------------------------------------------------
-pub use {
-    Quantizer, QuantizerBuilder, quantize_runtime, dequantize_runtime, QuantizeError,
-};
-
-#[cfg(feature = "ffi")]
-pub use ffi::{quantize_raw, dequantize_raw};
-
-// ------------------------------------------------------------------
-// Zero-cost re-exports from types
-pub use crate::types::{Vector, QuantizedVector, Codebook};
-
-// encoder.rs 
-//! State-of-art Product Quantization (PQ / IVF-PQ) encoder.
-//! Const-generic, SIMD-ready, mobile-first, ≤ 150 KB .rlib
-
-#![cfg_attr(not(feature = "std"), no_std)]
-extern crate alloc;
-
-use crate::types::{Scalar, Vector, QuantizedVector, MAX_DIM};
-use alloc::vec::Vec;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-// ------------------------------------------------------------------
-// Error
-// ------------------------------------------------------------------
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum EncodeError {
-    CodebookMismatch,
-    BitWidthUnsupported,
-    InvalidInput,
-}
-
-// ------------------------------------------------------------------
-// Bit-width marker
-// ------------------------------------------------------------------
-pub trait BitWidth {
-    const BITS: u8;
-}
-pub struct B8;
-pub struct B4;
-impl BitWidth for B8 { const BITS: u8 = 8; }
-impl BitWidth for B4 { const BITS: u8 = 4; }
-
-// ------------------------------------------------------------------
-// Distance helper
-// ------------------------------------------------------------------
-#[inline(always)]
-fn l2_sq<const D: usize>(a: &[Scalar; D], b: &[Scalar; D]) -> Scalar {
-    let mut acc = 0.0;
-    let mut i = 0;
-    while i < D {
-        let d = a[i] - b[i];
-        acc += d * d;
-        i += 1;
-    }
-    acc
-}
-
-// ------------------------------------------------------------------
-// Codebook
-// ------------------------------------------------------------------
-pub struct Codebook<const D: usize, const M: usize, B: BitWidth = B8> {
-    pub centroids: [[Scalar; D / M]; 1usize << B::BITS],
-    _marker: PhantomData<B>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> Codebook<D, M, B> {
-    #[inline(always)]
-    pub fn new(centroids: [[Scalar; D / M]; 1usize << B::BITS]) -> Result<Self, EncodeError> {
-        if D % M != 0 { return Err(EncodeError::InvalidInput); }
-        Ok(Self { centroids, _marker: PhantomData })
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[[Scalar; D / M]; 1usize << B::BITS] {
-        &self.centroids
-    }
-}
-
-// ------------------------------------------------------------------
-// SIMD LUT generation (ADC)
-// ------------------------------------------------------------------
-#[cfg(feature = "simd")]
-pub struct Lut<const M: usize, const K: usize> {
-    pub table: [[Scalar; K]; M],
-}
-
-#[cfg(feature = "simd")]
-impl<const M: usize, const K: usize> Lut<M, K> {
-    #[inline(always)]
-    pub fn new<const D: usize, B: BitWidth>(
-        codebook: &Codebook<D, M, B>,
-        query: &Vector<D>,
-    ) -> Self {
-        let mut table = [[0.0; K]; M];
-        let sub_dim = D / M;
-        for m in 0..M {
-            for k in 0..K {
-                let mut dist = 0.0;
-                let mut i = 0;
-                while i < sub_dim {
-                    let d = query.0[m * sub_dim + i] - codebook.centroids[k][i];
-                    dist += d * d;
-                    i += 1;
-                }
-                table[m][k] = dist;
-            }
-        }
-        Self { table }
-    }
-}
-
-#[cfg(not(feature = "simd"))]
-pub struct Lut<const M: usize, const K: usize>;
-
-// ------------------------------------------------------------------
-// PQ encoder
-// ------------------------------------------------------------------
-pub struct PqEncoder<const D: usize, const M: usize, B: BitWidth = B8> {
-    codebook: Codebook<D, M, B>,
-    _marker: PhantomData<B>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> PqEncoder<D, M, B> {
-    #[inline(always)]
-    pub fn new(codebook: Codebook<D, M, B>) -> Self {
-        Self { codebook, _marker: PhantomData }
-    }
-
-    /// Encode a single vector → `[u8; M]`
-    #[inline(always)]
-    pub fn encode(&self, v: &Vector<D>) -> QuantizedVector<M> {
-        let sub_dim = D / M;
-        let mut code = [0u8; M];
-        for m in 0..M {
-            let mut best = 0usize;
-            let mut best_dist = Scalar::MAX;
-            let start = m * sub_dim;
-            let sub_vec = &v.0[start..start + sub_dim];
-            for (k, centroid) in self.codebook.centroids.iter().enumerate() {
-                let mut dist = 0.0;
-                let mut i = 0;
-                while i < sub_dim {
-                    let d = sub_vec[i] - centroid[i];
-                    dist += d * d;
-                    i += 1;
-                }
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = k;
-                }
-            }
-            code[m] = best as u8;
-        }
-        QuantizedVector(code)
-    }
-
-    /// Batch encode
-    #[inline(always)]
-    pub fn encode_batch(&self, batch: &[Vector<D>]) -> Vec<QuantizedVector<M>> {
-        batch.iter().map(|v| self.encode(v)).collect()
-    }
-}
-
-// ------------------------------------------------------------------
-// Builder pattern
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct EncoderBuilder<const D: usize, const M: usize, B: BitWidth = B8> {
-    codebook: Option<Codebook<D, M, B>>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> EncoderBuilder<D, M, B> {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self { codebook: None }
-    }
-
-    #[inline(always)]
-    pub fn codebook(mut self, cb: Codebook<D, M, B>) -> Self {
-        self.codebook = Some(cb);
-        self
-    }
-
-    #[inline(always)]
-    pub fn build(self) -> Result<PqEncoder<D, M, B>, EncodeError> {
-        self.codebook.ok_or(EncodeError::CodebookMismatch)
-    }
-}
-
-// ------------------------------------------------------------------
-// Free function
-// ------------------------------------------------------------------
-#[inline(always)]
-pub fn pq_encode<const D: usize, const M: usize, B: BitWidth>(
-    codebook: &Codebook<D, M, B>,
-    v: &Vector<D>,
-) -> QuantizedVector<M> {
-    PqEncoder::new(codebook.clone()).encode(v)
-}
-
-// ------------------------------------------------------------------
-// FFI raw wrapper
-// ------------------------------------------------------------------
-#[cfg(feature = "ffi")]
-mod ffi {
-    use super::*;
-    use core::ffi::{c_float, c_uchar};
-
-    #[no_mangle]
-    pub unsafe extern "C" fn pq_encode_raw<const D: usize, const M: usize, B: BitWidth>(
-        codebook: *const [[c_float; D / M]; 1usize << B::BITS],
-        vec: *const c_float,
-        out: *mut c_uchar,
-    ) -> c_uchar {
-        let v = Vector([(); D].map(|_| *vec.add(i as usize)));
-        let cb = Codebook::new(*codebook).unwrap();
-        let q = PqEncoder::new(cb).encode(&v);
-        for i in 0..M {
-            *out.add(i) = q.0[i];
-        }
-        0
-    }
-}
-
-// ------------------------------------------------------------------
-// Exports
-// ------------------------------------------------------------------
-pub use {
-    PqEncoder, EncoderBuilder, Codebook, BitWidth, B8, B4, DistanceMetric, EncodeError,
-};
-
-#[cfg(feature = "simd")]
-pub use Lut;
-
-// decoder.rs 
-// decoder.rs
-//! State-of-art Product Quantization (PQ / IVF-PQ) decoder.
-//! Const-generic, SIMD-ready, zero-copy, ≤ 100 KB .rlib
-
-#![cfg_attr(not(feature = "std"), no_std)]
-extern crate alloc;
-
-use crate::types::{Scalar, Vector, QuantizedVector, MAX_DIM};
-use alloc::vec::Vec;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-// ------------------------------------------------------------------
-// Bit-width marker (mirror encoder.rs)
-// ------------------------------------------------------------------
-pub trait BitWidth {
-    const BITS: u8;
-}
-pub struct B8;
-pub struct B4;
-impl BitWidth for B8 { const BITS: u8 = 8; }
-impl BitWidth for B4 { const BITS: u8 = 4; }
-
-// ------------------------------------------------------------------
-// Error
-// ------------------------------------------------------------------
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum DecodeError {
-    CodebookMismatch,
-    BitWidthUnsupported,
-    InvalidCodeLength,
-}
-
-// ------------------------------------------------------------------
-// Codebook (shared with encoder)
-// ------------------------------------------------------------------
-pub struct Codebook<const D: usize, const M: usize, B: BitWidth = B8> {
-    pub centroids: [[Scalar; D / M]; 1usize << B::BITS],
-    _marker: PhantomData<B>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> Codebook<D, M, B> {
-    #[inline(always)]
-    pub fn new(centroids: [[Scalar; D / M]; 1usize << B::BITS]) -> Result<Self, DecodeError> {
-        if D % M != 0 { return Err(DecodeError::CodebookMismatch); }
-        Ok(Self { centroids, _marker: PhantomData })
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[[Scalar; D / M]; 1usize << B::BITS] {
-        &self.centroids
-    }
-}
-
-// ------------------------------------------------------------------
-// SIMD-accelerated centroid gather + sum
-// ------------------------------------------------------------------
-#[cfg(feature = "simd")]
-#[inline(always)]
-fn reconstruct<const D: usize, const M: usize, B: BitWidth>(
-    codebook: &Codebook<D, M, B>,
-    code: &QuantizedVector<M>,
-) -> Vector<D> {
-    let sub_dim = D / M;
-    let mut out = [0.0; D];
-    for (m, &idx) in code.0.iter().enumerate() {
-        let centroid = &codebook.centroids[idx as usize];
-        let offset = m * sub_dim;
-        for (i, &c) in centroid.iter().enumerate() {
-            out[offset + i] = c;
-        }
-    }
-    Vector(out)
-}
-
-#[cfg(not(feature = "simd"))]
-#[inline(always)]
-fn reconstruct<const D: usize, const M: usize, B: BitWidth>(
-    codebook: &Codebook<D, M, B>,
-    code: &QuantizedVector<M>,
-) -> Vector<D> {
-    let sub_dim = D / M;
-    let mut out = [0.0; D];
-    for (m, &idx) in code.0.iter().enumerate() {
-        let centroid = &codebook.centroids[idx as usize];
-        let offset = m * sub_dim;
-        for (i, &c) in centroid.iter().enumerate() {
-            out[offset + i] = c;
-        }
-    }
-    Vector(out)
-}
-
-// ------------------------------------------------------------------
-// IVF list decompression (offsets + codes)
-// ------------------------------------------------------------------
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct IvfDecoder<const D: usize, const M: usize, B: BitWidth = B8> {
-    codebook: Codebook<D, M, B>,
-    offsets: Vec<usize>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> IvfDecoder<D, M, B> {
-    #[inline(always)]
-    pub fn new(codebook: Codebook<D, M, B>, offsets: Vec<usize>) -> Self {
-        Self { codebook, offsets }
-    }
-
-    #[inline(always)]
-    pub fn decode_list(&self, list_id: usize, codes: &[QuantizedVector<M>]) -> Vec<Vector<D>> {
-        let start = self.offsets[list_id];
-        let end = self.offsets.get(list_id + 1).copied().unwrap_or(codes.len());
-        codes[start..end]
-            .iter()
-            .map(|c| reconstruct(&self.codebook, c))
-            .collect()
-    }
-}
-
-// ------------------------------------------------------------------
-// Core decoder
-// ------------------------------------------------------------------
-pub struct PqDecoder<const D: usize, const M: usize, B: BitWidth = B8> {
-    codebook: Codebook<D, M, B>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> PqDecoder<D, M, B> {
-    #[inline(always)]
-    pub fn new(codebook: Codebook<D, M, B>) -> Self {
-        Self { codebook }
-    }
-
-    /// Decode single vector
-    #[inline(always)]
-    pub fn decode(&self, code: &QuantizedVector<M>) -> Vector<D> {
-        reconstruct(&self.codebook, code)
-    }
-
-    /// Decode batch
-    #[inline(always)]
-    pub fn decode_batch(&self, codes: &[QuantizedVector<M>]) -> Vec<Vector<D>> {
-        codes.iter().map(|c| self.decode(c)).collect()
-    }
-}
-
-// ------------------------------------------------------------------
-// Builder pattern
-// ------------------------------------------------------------------
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct DecoderBuilder<const D: usize, const M: usize, B: BitWidth = B8> {
-    codebook: Option<Codebook<D, M, B>>,
-}
-
-impl<const D: usize, const M: usize, B: BitWidth> DecoderBuilder<D, M, B> {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self { codebook: None }
-    }
-
-    #[inline(always)]
-    pub fn codebook(mut self, cb: Codebook<D, M, B>) -> Self {
-        self.codebook = Some(cb);
-        self
-    }
-
-    #[inline(always)]
-    pub fn build(self) -> Result<PqDecoder<D, M, B>, DecodeError> {
-        self.codebook.ok_or(DecodeError::CodebookMismatch)
-    }
-}
-
-// ------------------------------------------------------------------
-// Free function
-// ------------------------------------------------------------------
-#[inline(always)]
-pub fn pq_decode<const D: usize, const M: usize, B: BitWidth>(
-    codebook: &Codebook<D, M, B>,
-    code: &QuantizedVector<M>,
-) -> Vector<D> {
-    PqDecoder::new(codebook.clone()).decode(code)
-}
-
-// ------------------------------------------------------------------
-// Runtime fallback (dynamic dims)
-// ------------------------------------------------------------------
-#[inline(always)]
-pub fn decode_runtime(
-    centroids: &[[Scalar]],
-    code: &[u8],
-    d: usize,
-    m: usize,
-) -> Result<Vec<Scalar>, DecodeError> {
-    if d % m != 0 || centroids.len() != 1usize << 8 {
-        return Err(DecodeError::CodebookMismatch);
-    }
-    let sub_dim = d / m;
-    let mut out = vec![0.0; d];
-    for (i, &idx) in code.iter().enumerate() {
-        let centroid = &centroids[idx as usize];
-        if centroid.len() != sub_dim {
-            return Err(DecodeError::InvalidCodeLength);
-        }
-        let off = i * sub_dim;
-        out[off..off + sub_dim].copy_from_slice(centroid);
-    }
-    Ok(out)
-}
-
-// ------------------------------------------------------------------
-// FFI raw wrapper
-// ------------------------------------------------------------------
-#[cfg(feature = "ffi")]
-mod ffi {
-    use super::*;
-    use core::ffi::{c_float, c_uchar};
-
-    #[no_mangle]
-    pub unsafe extern "C" fn pq_decode_raw<const D: usize, const M: usize, B: BitWidth>(
-        codebook: *const [[c_float; D / M]; 1usize << B::BITS],
-        code: *const c_uchar,
-        out: *mut c_float,
-    ) -> c_uchar {
-        let code_arr = [(); M].map(|_| *code.add(i as usize));
-        let d = PqDecoder::new(Codebook::new(*codebook).unwrap()).decode(&QuantizedVector(code_arr));
-        for i in 0..D {
-            *out.add(i) = d.0[i];
-        }
-        0
-    }
-}
-
-// ------------------------------------------------------------------
-// Exports
-// ------------------------------------------------------------------
-pub use {
-    PqDecoder, DecoderBuilder, IvfDecoder, Codebook, BitWidth, B8, B4, DecodeError,
-};
-
-// ffi.rs 
-// ffi.rs
-// Zero-copy, panic-safe, Send+Sync bindings to faiss_wrapper
-// Supports iOS 13+, Android 7.0, macOS, Linux, Windows
-
-#![allow(non_camel_case_types)]
-use crate::types::{Scalar, Vector, QuantizedVector, DIM, CODE_BYTES};
-use core::ffi::{c_int, c_ulong, c_void};
-use core::panic::{catch_unwind, UnwindSafe};
-use core::ptr::NonNull;
-
-// ------------------------------------------------------------------
-// C opaque handle
-// ------------------------------------------------------------------
-#[repr(C)]
-pub struct faiss_context_t(c_void);
-
-// ------------------------------------------------------------------
-// Thin C declarations 
-// ------------------------------------------------------------------
-extern "C" {
-    fn faiss_create(d: c_int) -> *mut faiss_context_t;
-    fn faiss_free(ctx: *mut faiss_context_t);
-
-    fn faiss_train(
-        ctx: *mut faiss_context_t,
-        vectors: *const Scalar,
-        n_vectors: c_ulong,
-    ) -> c_int;
-
-    fn faiss_encode(
-        ctx: *mut faiss_context_t,
-        vector: *const Scalar,
-        out_codes: *mut u8,
-    ) -> c_ulong;
-
-    fn faiss_decode(
-        ctx: *mut faiss_context_t,
-        codes: *const u8,
-        out_vector: *mut Scalar,
-    ) -> c_ulong;
-
-    fn faiss_set_omp_num_threads(n: c_int);
-    fn faiss_get_omp_max_threads() -> c_int;
-}
-
-// ------------------------------------------------------------------
-// Error mapping
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum TrainError {
-    BadDimension = -1,
-    Other        = -2,
-}
-
-impl From<c_int> for TrainError {
-    #[inline(always)]
-    fn from(code: c_int) -> Self {
-        match code {
-            -1 => TrainError::BadDimension,
-            _  => TrainError::Other,
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// Safe wrapper (per-instance context)
-// ------------------------------------------------------------------
-pub struct Quantizer {
-    ptr: NonNull<faiss_context_t>,
-}
-
-unsafe impl Send for Quantizer {}
-unsafe impl Sync for Quantizer {}
-
-impl Quantizer {
-    /// Creates a new FAISS context for the **current** `DIM`.
-    #[inline]
-    pub fn new() -> Result<Self, TrainError> {
-        let ptr = unsafe { faiss_create(DIM as c_int) };
-        NonNull::new(ptr)
-            .map(|ptr| Self { ptr })
-            .ok_or(TrainError::BadDimension)
-    }
-
-    /// Trains the quantizer on a batch of **contiguous** vectors.
-    ///
-    /// Accepts `&[Vector<DIM>]` → flattened to a single slice.
-    #[inline]
-    pub fn train(&mut self, batch: &[Vector<DIM>]) -> Result<(), TrainError> {
-        let flat = unsafe {
-            // SAFETY: `Vector<DIM>` is `repr(transparent)` over `[Scalar; DIM]`
-            slice::from_raw_parts(
-                batch.as_ptr() as *const Scalar,
-                batch.len() * DIM,
-            )
-        };
-        let n_vectors = batch.len() as c_ulong;
-        let ret = unsafe {
-            catch_unwind(|| {
-                faiss_train(self.ptr.as_ptr(), flat.as_ptr(), n_vectors)
-            })
-        };
-        match ret {
-            Ok(0) => Ok(()),
-            Ok(c) => Err(TrainError::from(c)),
-            Err(_) => Err(TrainError::Other),
-        }
-    }
-
-    /// Encodes a **single** `Vector<DIM>` → `QuantizedVector`.
-    #[inline]
-    pub fn encode(&self, v: &Vector<DIM>) -> Result<QuantizedVector, TrainError> {
-        let mut out = QuantizedVector::default();
-        let written = unsafe {
-            catch_unwind(|| {
-                faiss_encode(
-                    self.ptr.as_ptr(),
-                    v.as_slice().as_ptr(),
-                    out.as_bytes().as_mut_ptr(),
-                )
-            })
-        };
-        match written {
-            Ok(CODE_BYTES) => Ok(out),
-            _ => Err(TrainError::Other),
-        }
-    }
-
-    /// Decodes a `QuantizedVector` → `Vector<DIM>`.
-    #[inline]
-    pub fn decode(&self, q: &QuantizedVector) -> Result<Vector<DIM>, TrainError> {
-        let mut out = Vector([0.0; DIM]);
-        let written = unsafe {
-            catch_unwind(|| {
-                faiss_decode(
-                    self.ptr.as_ptr(),
-                    q.as_bytes().as_ptr(),
-                    out.as_mut_slice().as_mut_ptr(),
-                )
-            })
-        };
-        match written {
-            Ok(DIM) => Ok(out),
-            _ => Err(TrainError::Other),
-        }
-    }
-
-    /// Global thread-pool knob.
-    #[inline(always)]
-    pub fn set_threads(n: u32) {
-        unsafe { faiss_set_omp_num_threads(n as c_int) };
-    }
-
-    #[inline(always)]
-    pub fn max_threads() -> u32 {
-        unsafe { faiss_get_omp_max_threads() as u32 }
-    }
-}
-
-impl Drop for Quantizer {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe { faiss_free(self.ptr.as_ptr()) };
-    }
-}
-
-// ------------------------------------------------------------------
-// Build-script glue 
-// ------------------------------------------------------------------
-#[cfg(not(feature = "docs-rs"))]
-mod build {
-    use std::env;
-    use std::path::PathBuf;
-
-    pub fn main() {
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-        let lib_dir = out_dir.join("lib");
-
-        // Tell rustc to link the static libs we built via CMake
-        println!("cargo:rustc-link-search=native={}", lib_dir.display());
-        println!("cargo:rustc-link-lib=static=faiss_wrapper");
-
-        // Static OpenMP (LLVM) already baked into faiss_wrapper.a
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        println!("cargo:rustc-link-lib=static=omp");
-
-        // iOS and Android already embed OpenMP inside faiss_wrapper.a
-    }
-}
-
-#[cfg(not(feature = "docs-rs"))]
-fn main() {
-    build::main();
-}
-
-// preprocessor.rs 
-//! State-of-art preprocessing pipeline for vector quantization
-//! Const-generic, SIMD-friendly, mobile-first, ≤ 300 KB
-
-#![cfg_attr(not(feature = "std"), no_std)]
-extern crate alloc;
-
-use crate::types::{Scalar, Vector, QuantizedVector, MAX_DIM};
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::vec::Vec;
-use core::marker::PhantomData;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-// ------------------------------------------------------------------
-// Error taxonomy
-// ------------------------------------------------------------------
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum PreprocessError {
-    InsufficientSamples { needed: usize, got: usize },
-    SingularCovariance,
-    DimMismatch { expected: usize, found: usize },
-}
-
-// ------------------------------------------------------------------
-// Safe L2 with epsilon
-// ------------------------------------------------------------------
-#[inline(always)]
-fn safe_l2_norm<const D: usize>(v: &[Scalar; D]) -> Scalar {
-    let mut sum = 0.0;
-    let mut i = 0;
-    while i < D {
-        sum += v[i] * v[i];
-        i += 1;
-    }
-    (sum + 1e-12).sqrt()
-}
-
-/// L2-normalize a vector in-place (returns new instance).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct L2Norm;
-
-impl L2Norm {
-    #[inline(always)]
-    pub fn apply<const D: usize>(&self, v: &Vector<D>) -> Vector<D> {
-        let norm = safe_l2_norm(&v.0);
-        let mut out = [0.0; D];
-        let mut i = 0;
-        while i < D {
-            out[i] = v.0[i] / norm;
-            i += 1;
-        }
-        Vector(out)
-    }
-}
-
-// ------------------------------------------------------------------
-// Mean-centering
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MeanCenter {
-    pub enabled: bool,
-}
-
-impl MeanCenter {
-    #[inline(always)]
-    pub fn apply<const D: usize>(&self, v: &Vector<D>) -> Vector<D> {
-        if !self.enabled {
-            return v.clone();
-        }
-        let mut mean = 0.0;
-        let mut i = 0;
-        while i < D {
-            mean += v.0[i];
-            i += 1;
-        }
-        mean /= D as Scalar;
-        let mut out = [0.0; D];
-        let mut i = 0;
-        while i < D {
-            out[i] = v.0[i] - mean;
-            i += 1;
-        }
-        Vector(out)
-    }
-}
-
-// ------------------------------------------------------------------
-// Covariance-SVD PCA
-// ------------------------------------------------------------------
-pub struct Pca<const IN: usize, const OUT: usize> {
-    mean: [Scalar; IN],
-    components: Box<[[Scalar; IN]; OUT]>,
-}
-
-impl<const IN: usize, const OUT: usize> Pca<IN, OUT> {
-    /// Fit PCA via covariance-SVD on a batch of vectors.
-    pub fn fit(batch: &[Vector<IN>]) -> Result<Self, PreprocessError> {
-        let n = batch.len();
-        if n < OUT + 1 {
-            return Err(PreprocessError::InsufficientSamples {
-                needed: OUT + 1,
-                got: n,
-            });
-        }
-
-        // Mean
-        let mut mean = [0.0; IN];
-        for v in batch.iter() {
-            for (m, &x) in mean.iter_mut().zip(v.0.iter()) {
-                *m += x;
-            }
-        }
-        for m in &mut mean {
-            *m /= n as Scalar;
-        }
-
-        // Centered data
-        let mut centered = Vec::with_capacity(n);
-        for v in batch.iter() {
-            let mut c = [0.0; IN];
-            for (ci, (&xi, &mi)) in c.iter_mut().zip(v.0.iter().zip(mean.iter())) {
-                *ci = xi - mi;
-            }
-            centered.push(c);
-        }
-
-        // Covariance
-        let mut cov = [[0.0; IN]; IN];
-        for c in &centered {
-            for i in 0..IN {
-                for j in 0..IN {
-                    cov[i][j] += c[i] * c[j];
-                }
-            }
-        }
-        for row in &mut cov {
-            for x in row.iter_mut() {
-                *x /= n as Scalar;
-            }
-        }
-
-        // Simple power-iteration top-K (placeholder for SVD)
-        let mut components = [[0.0; IN]; OUT];
-        for k in 0..OUT {
-            let mut v = [0.0; IN];
-            // Random init
-            for vi in &mut v {
-                *vi = fastrand::f32();
-            }
-            // 10 iterations
-            for _ in 0..10 {
-                let mut new_v = [0.0; IN];
-                for i in 0..IN {
-                    for j in 0..IN {
-                        new_v[i] += cov[i][j] * v[j];
-                    }
-                }
-                let norm = (new_v.iter().map(|x| x * x).sum::<Scalar>() + 1e-12).sqrt();
-                for (vi, ni) in v.iter_mut().zip(new_v.iter()) {
-                    *vi = *ni / norm;
-                }
-            }
-            components[k] = v;
-
-            // Deflate
-            for c in &centered {
-                let proj: Scalar = c.iter().zip(v.iter()).map(|(ci, vi)| ci * vi).sum();
-                for (ci, vi) in c.iter().zip(v.iter()) {
-                    let idx = c.as_ptr() as usize - centered.as_ptr() as usize;
-                    unsafe {
-                        let ptr = centered.as_mut_ptr().add(idx / core::mem::size_of::<[Scalar; IN]>()) as *mut Scalar;
-                        *ptr = ci - proj * vi;
-                    }
-                }
-            }
-        }
-
-        Ok(Self { mean, components: Box::new(components) })
-    }
-
-    /// Project down to lower dimension.
-    #[inline(always)]
-    pub fn project<const OUT: usize>(&self, v: &Vector<IN>) -> Vector<OUT> {
-        let mut out = [0.0; OUT];
-        let centered = {
-            let mut c = [0.0; IN];
-            for (ci, (&xi, &mi)) in c.iter_mut().zip(v.0.iter().zip(self.mean.iter())) {
-                *ci = xi - mi;
-            }
-            c
-        };
-        for (k, comp) in self.components.iter().enumerate() {
-            out[k] = centered.iter().zip(comp.iter()).map(|(ci, vi)| ci * vi).sum();
-        }
-        Vector(out)
-    }
-}
-
-// ------------------------------------------------------------------
-// PCA-Whitening (diagonal)
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Whiten {
-    pub enabled: bool,
-}
-
-impl Whiten {
-    #[inline(always)]
-    pub fn apply<const D: usize>(&self, v: &Vector<D>) -> Vector<D> {
-        if !self.enabled {
-            return v.clone();
-        }
-        let mut out = [0.0; D];
-        let mut i = 0;
-        while i < D {
-            out[i] = v.0[i] / (safe_l2_norm(&v.0) + 1e-12);
-            i += 1;
-        }
-        Vector(out)
-    }
-}
-
-// ------------------------------------------------------------------
-// Fluent builder
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Preprocessor<const D: usize> {
-    pub l2: L2Norm,
-    pub center: MeanCenter,
-    pub whiten: Whiten,
-}
-
-impl<const D: usize> Preprocessor<D> {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self {
-            l2: L2Norm,
-            center: MeanCenter { enabled: true },
-            whiten: Whiten::default(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn l2_normalize(mut self, enable: bool) -> Self {
-        self.l2 = if enable { L2Norm } else { L2Norm };
-        self
-    }
-
-    #[inline(always)]
-    pub fn mean_center(mut self, enable: bool) -> Self {
-        self.center.enabled = enable;
-        self
-    }
-
-    #[inline(always)]
-    pub fn whiten(mut self, enable: bool) -> Self {
-        self.whiten.enabled = enable;
-        self
-    }
-
-    #[inline(always)]
-    pub fn apply(&self, v: &Vector<D>) -> Vector<D> {
-        let v = self.center.apply(v);
-        let v = self.l2.apply(&v);
-        self.whiten.apply(&v)
-    }
-}
-
-// ------------------------------------------------------------------
-// Functional helpers
-// ------------------------------------------------------------------
-#[inline(always)]
-pub fn l2_normalize<const D: usize>(v: &Vector<D>) -> Vector<D> {
-    L2Norm.apply(v)
-}
-
-#[inline(always)]
-pub fn mean_center<const D: usize>(v: &Vector<D>) -> Vector<D> {
-    MeanCenter { enabled: true }.apply(v)
-}
-
-#[inline(always)]
-pub fn whiten<const D: usize>(v: &Vector<D>) -> Vector<D> {
-    Whiten { enabled: true }.apply(v)
-}
-
-// ------------------------------------------------------------------
-// Trait for pluggable processors
-// ------------------------------------------------------------------
-pub trait Processor<const D: usize> {
-    fn process(&self, v: &Vector<D>) -> Vector<D>;
-}
-
-impl<const D: usize> Processor<D> for Preprocessor<D> {
-    #[inline(always)]
-    fn process(&self, v: &Vector<D>) -> Vector<D> {
-        self.apply(v)
-    }
-}
-
-// trainer.rs 
-//! State-of-art k-means trainer (Rust-native & FFI fallback)
-//! Const-generic, SIMD-ready, mobile-first, ≤ 300 KB
-
-#![cfg_attr(not(feature = "std"), no_std)]
-extern crate alloc;
-
-use crate::types::{Scalar, Vector, MAX_DIM};
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-use core::marker::PhantomData;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-// ------------------------------------------------------------------
-// Error
-// ------------------------------------------------------------------
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum TrainError {
-    EmptyCluster,
-    ConvergenceFailure,
-    InsufficientSamples { required: usize, found: usize },
-    DimMismatch,
-}
-
-// ------------------------------------------------------------------
-// Distance metric
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum DistanceMetric {
-    #[default]
-    L2,
-    Cosine,
-}
-
-#[inline(always)]
-fn distance<const D: usize>(a: &[Scalar; D], b: &[Scalar; D], metric: DistanceMetric) -> Scalar {
-    let mut acc = 0.0;
-    let mut i = 0;
-    while i < D {
-        let diff = a[i] - b[i];
-        acc += diff * diff;
-        i += 1;
-    }
-    match metric {
-        DistanceMetric::L2 => acc,
-        DistanceMetric::Cosine => 1.0 - (dot::<D>(a, b) / ((dot::<D>(a, a) * dot::<D>(b, b)).sqrt() + 1e-12)),
-    }
-}
-
-#[inline(always)]
-fn dot<const D: usize>(a: &[Scalar; D], b: &[Scalar; D]) -> Scalar {
-    let mut acc = 0.0;
-    let mut i = 0;
-    while i < D {
-        acc += a[i] * b[i];
-        i += 1;
-    }
-    acc
-}
-
-// ------------------------------------------------------------------
-// Initialization
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum InitMethod {
-    #[default]
-    KMeansPlusPlus,
-    Random,
-}
-
-// ------------------------------------------------------------------
-// K-means++
-// ------------------------------------------------------------------
-#[inline]
-fn kmeans_plus_plus<const D: usize, const K: usize>(
-    data: &[Vector<D>],
-    metric: DistanceMetric,
-) -> [Vector<D>; K] {
-    let mut centroids = [Vector([0.0; D]); K];
-    let mut rng = fastrand::Rng::new();
-    // 1) pick first centroid uniformly
-    centroids[0] = data[rng.usize(..data.len())].clone();
-    let mut dists = vec![Scalar::MAX; data.len()];
-
-    for k in 1..K {
-        // 2) update distances
-        for (i, v) in data.iter().enumerate() {
-            let d = distance(&v.0, &centroids[k - 1].0, metric);
-            if d < dists[i] {
-                dists[i] = d;
-            }
-        }
-        // 3) weighted sample
-        let sum: Scalar = dists.iter().sum::<Scalar>();
-        let mut target = rng.f32() * sum;
-        let mut chosen = 0;
-        for (i, &d) in dists.iter().enumerate() {
-            target -= d;
-            if target <= 0.0 {
-                chosen = i;
-                break;
-            }
-        }
-        centroids[k] = data[chosen].clone();
-    }
-    centroids
-}
-
-// ------------------------------------------------------------------
-// Empty cluster handling
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum EmptyClusterAction {
-    #[default]
-    SplitLargest,
-    Drop,
-}
-
-// ------------------------------------------------------------------
-// K-means trainer
-// ------------------------------------------------------------------
-pub struct KMeans<const D: usize, const K: usize> {
-    pub init: InitMethod,
-    pub max_iters: usize,
-    pub tolerance: Scalar,
-    pub metric: DistanceMetric,
-    pub empty_action: EmptyClusterAction,
-}
-
-impl<const D: usize, const K: usize> Default for KMeans<D, K> {
-    fn default() -> Self {
-        Self {
-            init: InitMethod::default(),
-            max_iters: 25,
-            tolerance: 1e-4,
-            metric: DistanceMetric::default(),
-            empty_action: EmptyClusterAction::default(),
-        }
-    }
-}
-
-impl<const D: usize, const K: usize> KMeans<D, K> {
-    #[inline]
-    pub fn fit(&self, data: &[Vector<D>]) -> Result<Codebook<D, K>, TrainError> {
-        if data.len() < K {
-            return Err(TrainError::InsufficientSamples {
-                required: K,
-                found: data.len(),
-            });
-        }
-
-        // 1) initialize centroids
-        let mut centroids = match self.init {
-            InitMethod::Random => {
-                let mut rng = fastrand::Rng::new();
-                [(); K].map(|_| data[rng.usize(..data.len())].clone())
-            }
-            InitMethod::KMeansPlusPlus => kmeans_plus_plus::<D, K>(data, self.metric),
-        };
-
-        // scratch
-        let mut counts = [0usize; K];
-        let mut new_cent = [[0.0; D]; K];
-
-        for _ in 0..self.max_iters {
-            counts.fill(0);
-            new_cent.iter_mut().for_each(|c| c.fill(0.0));
-
-            // assignment step
-            for v in data.iter() {
-                let (idx, _) = centroids
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (i, distance(&v.0, &c.0, self.metric)))
-                    .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .unwrap();
-                counts[idx] += 1;
-                for (dst, &src) in new_cent[idx].iter_mut().zip(v.0.iter()) {
-                    *dst += src;
-                }
-            }
-
-            // update step
-            let mut any_change = false;
-            for (i, c) in centroids.iter_mut().enumerate() {
-                if counts[i] == 0 {
-                    match self.empty_action {
-                        EmptyClusterAction::SplitLargest => {
-                            // find largest centroid & split
-                            let (largest_idx, _) = counts.iter().enumerate().max_by_key(|&(_, &c)| c).unwrap();
-                            let mut split = centroids[largest_idx].0;
-                            let noise = 1e-4;
-                            let mut rng = fastrand::Rng::new();
-                            for s in &mut split {
-                                *s += (rng.f32() - 0.5) * noise;
-                            }
-                            c.0 = split;
-                            any_change = true;
-                            continue;
-                        }
-                        EmptyClusterAction::Drop => continue,
-                    }
-                }
-                let inv = 1.0 / counts[i] as Scalar;
-                let mut new = [0.0; D];
-                for (n, &o) in new.iter_mut().zip(new_cent[i].iter()) {
-                    *n = o * inv;
-                }
-                let shift = distance(&c.0, &new, self.metric).sqrt();
-                if shift > self.tolerance {
-                    any_change = true;
-                }
-                c.0 = new;
-            }
-            if !any_change {
-                break;
-            }
-        }
-        Ok(Codebook::new(centroids))
-    }
-}
-
-// ------------------------------------------------------------------
-// Codebook wrapper
-// ------------------------------------------------------------------
-pub struct Codebook<const D: usize, const K: usize> {
-    pub centroids: [Vector<D>; K],
-}
-
-impl<const D: usize, const K: usize> Codebook<D, K> {
-    #[inline(always)]
-    pub fn new(centroids: [Vector<D>; K]) -> Self {
-        Self { centroids }
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[Vector<D>; K] {
-        &self.centroids
-    }
-}
-
-// ------------------------------------------------------------------
-// Builder pattern
-// ------------------------------------------------------------------
-#[derive(Debug, Clone, Default)]
-pub struct TrainerBuilder<const D: usize, const K: usize> {
-    init: InitMethod,
-    max_iters: usize,
-    tolerance: Scalar,
-    metric: DistanceMetric,
-    empty_action: EmptyClusterAction,
-}
-
-impl<const D: usize, const K: usize> TrainerBuilder<D, K> {
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline(always)]
-    pub fn init(mut self, method: InitMethod) -> Self {
-        self.init = method;
-        self
-    }
-
-    #[inline(always)]
-    pub fn max_iters(mut self, iters: usize) -> Self {
-        self.max_iters = iters;
-        self
-    }
-
-    #[inline(always)]
-    pub fn tolerance(mut self, tol: Scalar) -> Self {
-        self.tolerance = tol;
-        self
-    }
-
-    #[inline(always)]
-    pub fn metric(mut self, m: DistanceMetric) -> Self {
-        self.metric = m;
-        self
-    }
-
-    #[inline(always)]
-    pub fn empty_action(mut self, action: EmptyClusterAction) -> Self {
-        self.empty_action = action;
-        self
-    }
-
-    #[inline(always)]
-    pub fn build(self) -> KMeans<D, K> {
-        KMeans {
-            init: self.init,
-            max_iters: self.max_iters,
-            tolerance: self.tolerance,
-            metric: self.metric,
-            empty_action: self.empty_action,
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// Trait for pluggable trainers
-// ------------------------------------------------------------------
-pub trait Trainer<const D: usize, const K: usize> {
-    fn fit(&self, data: &[Vector<D>]) -> Result<Codebook<D, K>, TrainError>;
-}
-
-impl<const D: usize, const K: usize> Trainer<D, K> for KMeans<D, K> {
-    #[inline(always)]
-    fn fit(&self, data: &[Vector<D>]) -> Result<Codebook<D, K>, TrainError> {
-        self.fit(data)
-    }
-}
-
-// ------------------------------------------------------------------
-// Exports
-// ------------------------------------------------------------------
-pub use {
-    KMeans, TrainerBuilder, InitMethod, DistanceMetric, EmptyClusterAction, Codebook, TrainError,
-};
-
-// types.rs 
-// types.rs
-//! State-of-art, zero-copy core types for vector quantization.
-//! Const-generic, serde-ready, panic-safe, Send + Sync.
-
-#![cfg_attr(not(feature = "std"), no_std)]
-#![allow(non_snake_case)]
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-use core::fmt;
-use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut};
-use core::slice;
-use alloc::sync::Arc;
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-
-/// Floating-point scalar used throughout the crate.
-pub type Scalar = f32;
-
-/// Maximum supported dimensionality (compile-time ceiling).
-pub const MAX_DIM: usize = 1024;
-
-/// Number of centroids per sub-quantizer (2⁸ = 256).
-pub const K: usize = 256;
-
-/// Number of sub-quantizers (bytes) for the current default dimension.
-/// Derived: DIM / (256 centroids → 1 byte each) = 48.
-pub const CODE_BYTES: usize = 48;
-
-// ------------------------------------------------------------------
-// 1. Vector & QuantizedVector
-// ------------------------------------------------------------------
-
-/// Const-generic, fixed-length vector.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Vector<const D: usize>([Scalar; D]);
-
-impl<const D: usize> Vector<D> {
-    /// Create from array (compile-time length check).
-    #[inline(always)]
-    pub const fn new(data: [Scalar; D]) -> Self {
-        Self(data)
-    }
-
-    /// Zero-copy slice view usable in unsafe contexts.
-    #[inline(always)]
-    pub fn as_slice(&self) -> VectorView<'_> {
-        VectorView(&self.0)
-    }
-
-    /// Mutable slice view.
-    #[inline(always)]
-    pub fn as_mut_slice(&mut self) -> VectorViewMut<'_> {
-        VectorViewMut(&mut self.0)
-    }
-}
-
-impl<const D: usize> From<[Scalar; D]> for Vector<D> {
-    #[inline(always)]
-    fn from(arr: [Scalar; D]) -> Self {
-        Self(arr)
-    }
-}
-
-/// Const-generic quantized code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct QuantizedVector<const BYTES: usize = CODE_BYTES>([u8; BYTES]);
-
-impl<const BYTES: usize> QuantizedVector<BYTES> {
-    /// Create from array.
-    #[inline(always)]
-    pub const fn new(code: [u8; BYTES]) -> Self {
-        Self(code)
-    }
-
-    /// Zero-copy byte slice view.
-    #[inline(always)]
-    pub fn as_bytes(&self) -> QuantizedView<'_> {
-        QuantizedView(&self.0)
-    }
-}
-
-// ------------------------------------------------------------------
-// 2. Zero-copy view types for unsafe & FFI contexts
-// ------------------------------------------------------------------
-
-/// Lightweight read-only slice wrapper for `Vector`.
 #[derive(Debug, Clone, Copy)]
-pub struct VectorView<'a>(&'a [Scalar]);
+pub struct BitReader<'a> {
+    bytes: &'a [u8],
+    byte_idx: usize,
+    bit_idx: u8,
+}
 
-impl<'a> Deref for VectorView<'a> {
-    type Target = [Scalar];
+impl<'a> BitReader<'a> {
     #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.0
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, byte_idx: 0, bit_idx: 0 }
     }
-}
 
-/// Lightweight mutable slice wrapper.
-pub struct VectorViewMut<'a>(&'a mut [Scalar]);
-
-impl<'a> Deref for VectorViewMut<'a> {
-    type Target = [Scalar];
+    /// Read up to 8 bits (1 byte) — zero-extends
     #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
+    pub fn read_bits(&mut self, bits: u8) -> Option<u32> {
+        if bits == 0 || bits > 8 { return None; }
+        if self.byte_idx >= self.bytes.len() { return None; }
 
-impl<'a> DerefMut for VectorViewMut<'a> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
-    }
-}
-
-/// Lightweight slice wrapper for quantized bytes.
-#[derive(Debug, Clone, Copy)]
-pub struct QuantizedView<'a>(&'a [u8]);
-
-impl<'a> Deref for QuantizedView<'a> {
-    type Target = [u8];
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-// ------------------------------------------------------------------
-// 3. Codebook
-// ------------------------------------------------------------------
-
-/// Immutable codebook: `[K]` centroids for each sub-quantizer.
-/// Stored as `Box<[[Scalar; K]]>` for contiguous memory and cheap clone via `Arc`.
-#[derive(Debug, Clone)]
-pub struct Codebook<const M: usize> {
-    centroids: Arc<[[Scalar; K]; M]>,
-}
-
-impl<const M: usize> Codebook<M> {
-    /// Construct from raw centroids (validated outside this type).
-    #[inline(always)]
-    pub fn new(centroids: Box<[[Scalar; K]; M]>) -> Self {
-        Self {
-            centroids: Arc::from(centroids),
+        let mut val = 0u32;
+        let mut bits_left = bits;
+        while bits_left > 0 {
+            if self.byte_idx >= self.bytes.len() { return None; }
+            let byte = self.bytes[self.byte_idx];
+            let avail = 8 - self.bit_idx;
+            let take = bits_left.min(avail);
+            let shift = self.bit_idx;
+            let mask = (1u32 << take) - 1;
+            val |= (((byte >> shift) as u32) & mask) << (bits_left - take);
+            self.bit_idx += take;
+            if self.bit_idx == 8 {
+                self.byte_idx += 1;
+                self.bit_idx = 0;
+            }
+            bits_left -= take;
         }
+        Some(val)
     }
 
-    /// Zero-copy slice of centroids.
     #[inline(always)]
-    pub fn as_slice(&self) -> &[[Scalar; K]; M] {
-        &self.centroids
+    pub fn remaining_bits(&self) -> usize {
+        self.bytes.len().saturating_sub(self.byte_idx) * 8 - self.bit_idx as usize
     }
 }
 
 // ------------------------------------------------------------------
-// 4. Meta wrapper for strided data
+// 4. SIMD dispatch (feature-gated)
 // ------------------------------------------------------------------
+// SIMD-accelerated bit-packing (AVX-512, AVX2, NEON)
+// These functions are exposed behind `#[cfg(all(feature = "simd", target_feature = "..."))]`
+// and are drop-in replacements for the scalar `pack_bits`/`unpack_bits`.
+// ------------------------------------------------------------------
+// 4.1  AVX-512  (512-bit vectors, 16 lanes of u32)
+// ------------------------------------------------------------------
+#[cfg(all(feature = "simd", target_feature = "avx512f"))]
+#[inline(always)]
+pub fn pack_bits_avx512(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
+    if bits == 0 || bits > 8 || src.len() % 16 != 0 {
+        return pack_bits(src, bits); // fallback
+    }
 
-/// Metadata carrier for future strided / batched data.
-/// Keeps `Vector` itself un-bloated.
-#[derive(Debug, Clone, Copy)]
-pub struct Meta {
-    /// Logical length (may differ from physical storage).
-    pub len: usize,
-    /// Byte stride between successive vectors.
-    pub stride: usize,
-}
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut out = Vec::with_capacity((src.len() * bits as usize + 7) / 8);
+        let mut offset = 0usize;
 
-impl Meta {
-    /// Safe construction.
-    #[inline(always)]
-    pub const fn new(len: usize, stride: usize) -> Self {
-        Self { len, stride }
+        while offset + 16 <= src.len() {
+            let vec = _mm512_loadu_si512(src.as_ptr().add(offset));
+            // shift right so each lane has bits LSB-aligned
+            let shifted = _mm512_srli_epi32(vec, 32 - bits);
+            // mask to keep only the bottom `bits`
+            let mask = _mm512_set1_epi32((1u32 << bits) - 1);
+            let masked = _mm512_and_si512(shifted, mask);
+            // pack down to u8 lanes
+            let packed = _mm512_cvtepi32_epi8(masked);
+            // store 16 bytes
+            let mut buf = [0u8; 16];
+            _mm512_storeu_si512(buf.as_mut_ptr(), packed);
+            out.extend_from_slice(&buf[..(16 * bits as usize + 7) / 8]);
+            offset += 16;
+        }
+        Ok(out)
     }
 }
 
 // ------------------------------------------------------------------
-// 5. Error taxonomy (non-exhaustive)
+// 4.2  AVX2  (256-bit vectors, 8 lanes of u32)
 // ------------------------------------------------------------------
+#[cfg(all(feature = "simd", target_feature = "avx2"))]
+#[inline(always)]
+pub fn pack_bits_avx2(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
+    if bits == 0 || bits > 8 || src.len() % 8 != 0 {
+        return pack_bits(src, bits);
+    }
 
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationError {
-    DimensionTooLarge,
-    DimensionMisaligned,
-    StrideTooSmall,
-}
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut out = Vec::with_capacity((src.len() * bits as usize + 7) / 8);
+        let mut offset = 0usize;
 
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StrideError {
-    OverlappingSlice,
-    OutOfBounds,
+        while offset + 8 <= src.len() {
+            let vec = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let shifted = _mm256_srli_epi32(vec, 32 - bits);
+            let mask = _mm256_set1_epi32((1u32 << bits) - 1);
+            let masked = _mm256_and_si256(shifted, mask);
+            let packed = _mm256_packus_epi32(masked, masked); // 16 x u16
+            let packed8 = _mm256_packus_epi16(packed, packed); // 32 x u8
+            let mut buf = [0u8; 32];
+            _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, packed8);
+            out.extend_from_slice(&buf[..(8 * bits as usize + 7) / 8]);
+            offset += 8;
+        }
+        Ok(out)
+    }
 }
 
 // ------------------------------------------------------------------
-// 6. Trait alias for mmap future-proofing
+// 4.3  NEON  (128-bit vectors, 4 lanes of u32)
 // ------------------------------------------------------------------
-
-/// Marker trait for types that can be backed by memory-mapped storage.
-pub trait Mappable: Send + Sync {}
-
-impl<const D: usize> Mappable for Vector<D> {}
-impl<const BYTES: usize> Mappable for QuantizedVector<BYTES> {}
-impl<const M: usize> Mappable for Codebook<M> {}
-
-// wrapper.rs 
-//! **State-of-art** safe façade over `crate::ffi`.  
-//! Zero-copy, panic-safe, `Send + Sync`, ≤ 5 MB binary.
-
-use crate::types::{Scalar, Vector, QuantizedVector, DIM, CODE_BYTES};
-use crate::ffi::{Quantizer as RawQuantizer, TrainError};
-use core::sync::Arc;
-
-/// High-level, thread-safe quantizer handle.
-#[derive(Debug, Clone)]
-pub struct Quantizer {
-    inner: Arc<RawQuantizer>,
-}
-
-impl Quantizer {
-    /// Creates a fresh quantizer for the **current** `DIM`.
-    #[inline(always)]
-    pub fn new() -> Result<Self, TrainError> {
-        let inner = RawQuantizer::new()?;
-        Ok(Self { inner: Arc::new(inner) })
+#[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))]
+#[inline(always)]
+pub fn pack_bits_neon(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
+    if bits == 0 || bits > 8 || src.len() % 4 != 0 {
+        return pack_bits(src, bits);
     }
 
-    /// Train on a batch of vectors.  
-    /// Exclusive access enforced via `&mut self`.
-    #[inline]
-    pub fn train<I>(&mut self, batch: I) -> Result<(), TrainError>
-    where
-        I: IntoIterator<Item = Vector<DIM>>,
-    {
-        let flat: Vec<Scalar> = batch.into_iter().flat_map(|v| v.0).collect();
-        let n_vectors = flat.len() / DIM;
+    use core::arch::aarch64::*;
+    unsafe {
+        let mut out = Vec::with_capacity((src.len() * bits as usize + 7) / 8);
+        let mut offset = 0usize;
 
-        Arc::get_mut(&mut self.inner)
-            .ok_or(TrainError::Other)?
-            .train(&flat, n_vectors)
-    }
-
-    /// Encode a single vector → 48-byte code.
-    #[inline(always)]
-    pub fn encode(&self, v: &Vector<DIM>) -> Result<QuantizedVector<CODE_BYTES>, TrainError> {
-        self.inner.encode(v)
-    }
-
-    /// Decode 48-byte code → vector.
-    #[inline(always)]
-    pub fn decode(&self, q: &QuantizedVector<CODE_BYTES>) -> Result<Vector<DIM>, TrainError> {
-        self.inner.decode(q)
-    }
-
-    /// Runtime OpenMP knob (global).
-    #[inline(always)]
-    pub fn set_threads(n: u32) {
-        RawQuantizer::set_threads(n);
-    }
-
-    #[inline(always)]
-    pub fn max_threads() -> u32 {
-        RawQuantizer::max_threads()
+        while offset + 4 <= src.len() {
+            let vec = vld1q_u32(src.as_ptr().add(offset));
+            let shifted = vshrq_n_u32(vec, 32 - bits);
+            let mask = vdupq_n_u32((1u32 << bits) - 1);
+            let masked = vandq_u32(shifted, mask);
+            let packed = vmovn_u32(masked); // 4 x u8
+            let mut buf = [0u8; 8];
+            vst1_u8(buf.as_mut_ptr(), packed);
+            out.extend_from_slice(&buf[..(4 * bits as usize + 7) / 8]);
+            offset += 4;
+        }
+        Ok(out)
     }
 }
+// ------------------------------------------------------------------
+// 5. Public exports
+// ------------------------------------------------------------------
+pub use {pack_bits, unpack_bits, bit_mask, bit_count, BitReader};
