@@ -30,7 +30,7 @@ const SplashScreen = ({ onComplete }) => {
       {/* Logo Image */}
       <div style={{ marginBottom: '2rem' }}>
         <img 
-          src="/assets/AthenaDark1.png" 
+          src="../assets/AthenaDarkBadge.xcf" 
           alt="ATHENA logo" 
           style={{ maxWidth: '300px' }}
         />
@@ -49,13 +49,43 @@ const SplashScreen = ({ onComplete }) => {
         />
         
         <DecryptedText
-          text="HVMANAE"
+          text="HVMANAE."
           speed={70}
           sequential={true}
           revealDirection="start"
           useOriginalCharsOnly={true}
           animateOn="view"
           style={{ fontSize: '1.5rem' }}
+        />
+
+        <DecryptedText
+          text="ARTIFEX LINGVAE"
+          speed={50}
+          sequential={true}
+          revealDirection="start"
+          useOriginalCharsOnly={true}
+          animateOn="view"
+          style={{fontSize: '1.8rem', marginBottom: '1rem'}}
+        />
+
+        <DecryptedText
+          text="MACHINAE."
+          speed={70}
+          sequential={true}
+          revealDirection="start"
+          useOriginalCharsOnly={true}
+          animateOn="view"
+          style={{ fontSize: '1.5rem' }}
+        />
+
+        <DecryptedText
+          text="ARTIFEX TVA."
+          speed={50}
+          sequential={true}
+          revealDirection="start"
+          useOriginalCharsOnly={true}
+          animateOn="view"
+          style={{fontSize: '1.8rem', marginBottom: '1rem'}}
         />
       </div>
     </motion.div>

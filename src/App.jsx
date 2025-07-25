@@ -1,6 +1,7 @@
 import React, { useReducer, useState } from 'react';
 import { Routes, Route, useNavigate } from 'react-router-dom';
 import WelcomeContainer from './pages/WelcomeContainer';
+import SplashScreen from './pages/SplashScreen';
 import Chat from './pages/Chat';
 import LanguageDropdown from './translation/LanguageDropdown';
 import translator from './translation/main';

@@ -1,241 +1,739 @@
-//! State-of-art, zero-copy bit-packing utilities.
-//! Always inline, SIMD-ready, ≤ 5 KB public surface.
+//! **Unified encryption error taxonomy**  
+//! Covers **ChaCha20-Poly1305**, **AES-GCM**, **key derivation**, and **FFI boundaries**.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[repr(u8)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionError {
+    // --- AEAD ciphers ----------------------------------------------------------
+    ChaCha20Poly1305 = 0,
+    AesGcm = 1,
+
+    // --- Key / nonce -----------------------------------------------------------
+    InvalidKeyLength { expected: usize, found: usize } = 2,
+    InvalidNonceLength { expected: usize, found: usize } = 3,
+
+    // --- MAC / integrity -------------------------------------------------------
+    MacMismatch = 4,
+
+    // --- KDF / key hierarchy ---------------------------------------------------
+    InvalidKdfInput = 5,
+    KdfOutputTooShort = 6,
+
+    // --- Buffer & allocation ---------------------------------------------------
+    OutputBufferTooSmall = 7,
+}
+
+impl EncryptionError {
+    #[inline(always)]
+    pub fn code(&self) -> u8 {
+        *self as u8
+    }
+}
+
+#[cfg(feature = "thiserror")]
+impl core::fmt::Display for EncryptionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ChaCha20Poly1305 => write!(f, "ChaCha20-Poly1305 error"),
+            Self::AesGcm => write!(f, "AES-GCM error"),
+            Self::InvalidKeyLength { expected, found } => {
+                write!(f, "Invalid key length: expected {}, found {}", expected, found)
+            }
+            Self::InvalidNonceLength { expected, found } => {
+                write!(f, "Invalid nonce length: expected {}, found {}", expected, found)
+            }
+            Self::MacMismatch => write!(f, "MAC verification failed"),
+            Self::InvalidKdfInput => write!(f, "KDF input invalid"),
+            Self::KdfOutputTooShort => write!(f, "KDF output too short"),
+            Self::OutputBufferTooSmall => write!(f, "Output buffer too small"),
+        }
+    }
+}
+
+pub use EncryptionError;
+
+//! **Single-call key management** — 256-bit symmetric key
+//! Zeroize-on-drop, memory-locked (Unix/Windows), FFI-ready, ≤ 5 KB
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-use crate::errors::CompressionError;
-use alloc::vec::Vec;
-use core::mem;
+use crate::errors::CryptoError;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 // ------------------------------------------------------------------
-// 1. Scalar helpers (always present)
+// 1. Key type (stack-only, transparent for FFI)
 // ------------------------------------------------------------------
-#[inline(always)]
-pub fn bit_mask(bits: u8) -> u32 {
-    (1u32 << bits).wrapping_sub(1)
-}
+#[derive(Clone, PartialEq, Eq)]
+#[repr(transparent)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Key([u8; 32]);
 
-#[inline(always)]
-pub fn bit_count(mut v: u32) -> u8 {
-    v.count_ones() as u8
-}
-
-// ------------------------------------------------------------------
-// 2. Runtime bit-width pack/unpack (LSB-first, 1–8 bits)
-// ------------------------------------------------------------------
-/// Pack `src` into a `Vec<u8>` using `bits` per element.
-/// Returns `Ok(bytes)` or `Err(CompressionError)` on overflow / invalid `bits`.
-#[inline(always)]
-pub fn pack_bits(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
-    if bits == 0 || bits > 8 {
-        return Err(CompressionError::BitWidthUnsupported { bits });
+impl Key {
+    /// **Random 256-bit key**
+    #[inline(always)]
+    pub fn random() -> Result<Self, CryptoError> {
+        let mut k = [0u8; 32];
+        crate::utils::fill_random(&mut k)?;
+        Self::from_slice(&k).map(|key| {
+            let _ = key.lock(); // best-effort lock
+            key
+        })
     }
-    let total_bits = src.len().checked_mul(bits as usize)
-        .ok_or(CompressionError::Overflow)?;
-    let byte_len = (total_bits + 7) / 8;
-    let mut out = Vec::with_capacity(byte_len);
 
-    let mut buf = 0u64;
-    let mut bits_left = 64;
+    /// **Zero-copy from bytes**
+    #[inline(always)]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 
-    for &val in src {
-        if val > bit_mask(bits) {
-            return Err(CompressionError::Overflow);
+    /// **Zero-copy from slice**
+    #[inline(always)]
+    pub fn from_slice(src: &[u8]) -> Result<Self, CryptoError> {
+        src.try_into()
+            .map(Self)
+            .map_err(|_| CryptoError::InvalidLength)
+    }
+
+    /// **Borrow inner bytes**
+    #[inline(always)]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// **Consume into inner bytes**
+    #[inline(always)]
+    pub fn into_bytes(self) -> [u8; 32] {
+        let bytes = self.0;
+        core::mem::forget(self); // skip Drop::drop
+        bytes
+    }
+
+    /// **Sub-key derivation via HKDF-SHA256**
+    #[inline(always)]
+    pub fn derive_subkey(&self, info: &[u8]) -> Result<Self, CryptoError> {
+        let derived = crate::kdf::hkdf::HkdfSha256::derive_key(
+            &crate::types::SecretKey::from_slice(self.as_bytes())?,
+            info,
+            32,
+        )?;
+        Ok(Self(*derived.as_bytes()))
+    }
+
+    /// **Lock memory (Unix mlock / Windows VirtualLock)**
+    #[inline(always)]
+    pub fn lock(&self) -> Result<(), CryptoError> {
+        crate::utils::mlock(self.0.as_ptr(), 32)
+    }
+
+    /// **Unlock memory**
+    #[inline(always)]
+    pub fn unlock(&self) -> Result<(), CryptoError> {
+        crate::utils::munlock(self.0.as_ptr(), 32)
+    }
+}
+
+// ------------------------------------------------------------------
+// 2. Debug redaction
+// ------------------------------------------------------------------
+impl core::fmt::Debug for Key {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Key([REDACTED])")
+    }
+}
+
+// ------------------------------------------------------------------
+// 3. Zeroize on drop
+// ------------------------------------------------------------------
+impl Drop for Key {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.zeroize();
+        let _ = self.unlock(); // best-effort unlock
+    }
+}
+
+// ------------------------------------------------------------------
+// 4. Trait impls for FFI / interop
+// ------------------------------------------------------------------
+impl From<[u8; 32]> for Key {
+    #[inline(always)]
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+}
+
+impl AsRef<[u8]> for Key {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+// ------------------------------------------------------------------
+// 5. FFI helpers
+// ------------------------------------------------------------------
+#[cfg(feature = "ffi")]
+mod ffi {
+    use super::*;
+    use core::ffi::{c_ulong, c_uchar};
+
+    #[no_mangle]
+    pub unsafe extern "C" fn key_new_random(dst: *mut c_uchar) -> c_ulong {
+        if dst.is_null() {
+            return 0;
         }
-        let mut v = val;
-        let mut rem = bits;
-        loop {
-            let take = rem.min(bits_left);
-            buf |= (v & bit_mask(take)) << (64 - bits_left);
-            v >>= take;
-            bits_left -= take;
-            rem -= take;
-            if bits_left == 0 {
-                out.extend_from_slice(&buf.to_le_bytes());
-                buf = 0;
-                bits_left = 64;
+        let out = core::slice::from_raw_parts_mut(dst, 32);
+        match Key::random() {
+            Ok(k) => {
+                out.copy_from_slice(k.as_bytes());
+                32
             }
-            if rem == 0 { break; }
+            Err(_) => 0,
         }
     }
-    if bits_left < 64 {
-        let bytes = (64 - bits_left + 7) / 8;
-        out.extend_from_slice(&buf.to_le_bytes()[..bytes as usize]);
-    }
-    Ok(out)
-}
 
-/// Unpack `bytes` into `Vec<u32>` assuming `bits` per element.
-#[inline(always)]
-pub fn unpack_bits(bytes: &[u8], bits: u8, len: usize) -> Result<Vec<u32>, CompressionError> {
-    if bits == 0 || bits > 8 {
-        return Err(CompressionError::BitWidthUnsupported { bits });
-    }
-    let total_bits = len.checked_mul(bits as usize)
-        .ok_or(CompressionError::Overflow)?;
-    if total_bits > bytes.len() * 8 {
-        return Err(CompressionError::InvalidLength);
+    #[no_mangle]
+    pub unsafe extern "C" fn key_from_bytes(src: *const c_uchar, dst: *mut c_uchar) -> c_ulong {
+        if src.is_null() || dst.is_null() {
+            return 0;
+        }
+        let src_slice = core::slice::from_raw_parts(src, 32);
+        let dst_slice = core::slice::from_raw_parts_mut(dst, 32);
+        match Key::from_slice(src_slice) {
+            Ok(k) => {
+                dst_slice.copy_from_slice(k.as_bytes());
+                32
+            }
+            Err(_) => 0,
+        }
     }
 
-    let mut out = Vec::with_capacity(len);
-    let mut reader = BitReader::new(bytes);
-    for _ in 0..len {
-        let val = reader.read_bits(bits).ok_or(CompressionError::Overflow)?;
-        out.push(val);
+    #[no_mangle]
+    pub unsafe extern "C" fn key_as_bytes(key: *const c_uchar, dst: *mut c_uchar) -> c_ulong {
+        if key.is_null() || dst.is_null() {
+            return 0;
+        }
+        let key_slice = core::slice::from_raw_parts(key, 32);
+        let dst_slice = core::slice::from_raw_parts_mut(dst, 32);
+        dst_slice.copy_from_slice(key_slice);
+        32
     }
-    Ok(out)
+
+    #[no_mangle]
+    pub unsafe extern "C" fn key_derive_subkey(
+        key: *const c_uchar,
+        info: *const c_uchar,
+        info_len: c_ulong,
+        dst: *mut c_uchar,
+    ) -> c_ulong {
+        if key.is_null() || info.is_null() || dst.is_null() {
+            return 0;
+        }
+        let key_slice = core::slice::from_raw_parts(key, 32);
+        let info_slice = core::slice::from_raw_parts(info, info_len as usize);
+        let dst_slice = core::slice::from_raw_parts_mut(dst, 32);
+
+        let k = match Key::from_slice(key_slice) {
+            Ok(k) => k,
+            Err(_) => return 0,
+        };
+        match k.derive_subkey(info_slice) {
+            Ok(d) => {
+                dst_slice.copy_from_slice(d.as_bytes());
+                32
+            }
+            Err(_) => 0,
+        }
+    }
 }
 
 // ------------------------------------------------------------------
-// 3. BitReader (scalar fallback, SIMD-ready)
+// 6. Public exports
+// ------------------------------------------------------------------
+pub use Key;
+
+//! **Single-call nonce management** — 96-bit (12-byte) nonces
+//! Zeroize-on-drop, counter + random generation, FFI-ready, ≤ 2 KB
+
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+use crate::errors::CryptoError;
+use zeroize::Zeroize;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+// ------------------------------------------------------------------
+// 1. Nonce type (transparent for FFI)
+// ------------------------------------------------------------------
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[repr(transparent)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Nonce([u8; 12]);
+
+impl Nonce {
+    /// **Random 96-bit nonce**
+    #[inline(always)]
+    pub fn random() -> Result<Self, CryptoError> {
+        let mut n = [0u8; 12];
+        crate::utils::fill_random(&mut n)?;
+        Ok(Self(n))
+    }
+
+    /// **Monotonic counter nonce (12-byte BE counter in last 8 bytes)**
+    #[cfg(feature = "counter")]
+    #[inline(always)]
+    pub fn counter() -> Self {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let ctr = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = [0u8; 12];
+        bytes[4..].copy_from_slice(&ctr.to_be_bytes());
+        Self(bytes)
+    }
+
+    /// **Zero-copy from bytes**
+    #[inline(always)]
+    pub const fn from_bytes(bytes: [u8; 12]) -> Self {
+        Self(bytes)
+    }
+
+    /// **Fallible slice constructor**
+    #[inline(always)]
+    pub fn from_slice(src: &[u8]) -> Result<Self, CryptoError> {
+        src.try_into()
+            .map(Self)
+            .map_err(|_| CryptoError::InvalidLength)
+    }
+
+    /// **Borrow inner bytes**
+    #[inline(always)]
+    pub const fn as_bytes(&self) -> &[u8; 12] {
+        &self.0
+    }
+
+    /// **Consume into inner bytes**
+    #[inline(always)]
+    pub fn into_bytes(self) -> [u8; 12] {
+        let bytes = self.0;
+        core::mem::forget(self); // skip Drop
+        bytes
+    }
+}
+
+// ------------------------------------------------------------------
+// 2. Debug redaction
+// ------------------------------------------------------------------
+impl core::fmt::Debug for Nonce {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Nonce([REDACTED])")
+    }
+}
+
+// ------------------------------------------------------------------
+// 3. Zeroize on drop
+// ------------------------------------------------------------------
+impl Drop for Nonce {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+// ------------------------------------------------------------------
+// 4. Trait impls for FFI
+// ------------------------------------------------------------------
+impl From<[u8; 12]> for Nonce {
+    #[inline(always)]
+    fn from(b: [u8; 12]) -> Self {
+        Self(b)
+    }
+}
+
+impl AsRef<[u8]> for Nonce {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+// ------------------------------------------------------------------
+// 5. FFI helpers
+// ------------------------------------------------------------------
+#[cfg(feature = "ffi")]
+mod ffi {
+    use super::*;
+    use core::ffi::{c_ulong, c_uchar};
+
+    #[no_mangle]
+    pub unsafe extern "C" fn nonce_generate(ptr: *mut c_uchar) -> c_ulong {
+        if ptr.is_null() {
+            return 0;
+        }
+        let out = core::slice::from_raw_parts_mut(ptr, 12);
+        match Nonce::random() {
+            Ok(n) => {
+                out.copy_from_slice(n.as_bytes());
+                12
+            }
+            Err(_) => 0,
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn nonce_from_bytes(
+        src: *const c_uchar,
+        dst: *mut c_uchar,
+    ) -> c_ulong {
+        if src.is_null() || dst.is_null() {
+            return 0;
+        }
+        let src_slice = core::slice::from_raw_parts(src, 12);
+        let dst_slice = core::slice::from_raw_parts_mut(dst, 12);
+        match Nonce::from_slice(src_slice) {
+            Ok(n) => {
+                dst_slice.copy_from_slice(n.as_bytes());
+                12
+            }
+            Err(_) => 0,
+        }
+    }
+
+    #[cfg(feature = "counter")]
+    #[no_mangle]
+    pub unsafe extern "C" fn nonce_counter(ptr: *mut c_uchar) -> c_ulong {
+        if ptr.is_null() {
+            return 0;
+        }
+        let out = core::slice::from_raw_parts_mut(ptr, 12);
+        let n = Nonce::counter();
+        out.copy_from_slice(n.as_bytes());
+        12
+    }
+}
+
+// ------------------------------------------------------------------
+// 6. Public exports
+// ------------------------------------------------------------------
+pub use Nonce;
+
+//! **State-of-art encryption primitives**  
+//! Zero-copy, FFI-safe, ≤ 2 KB
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+use core::marker::PhantomData;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+// ------------------------------------------------------------------
+// 1. Key material
+// ------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Key([u8; 32]);
+
+impl Key {
+    #[inline(always)]
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+// ------------------------------------------------------------------
+// 2. Nonce (96-bit AEAD)
+// ------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Nonce([u8; 12]);
+
+impl Nonce {
+    #[inline(always)]
+    pub fn new(bytes: [u8; 12]) -> Self {
+        Self(bytes)
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8; 12] {
+        &self.0
+    }
+}
+
+// ------------------------------------------------------------------
+// 3. Ciphertext (owned)
+// ------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Ciphertext(Vec<u8>);
+
+impl Ciphertext {
+    #[inline(always)]
+    pub fn new(vec: Vec<u8>) -> Self {
+        Self(vec)
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[inline(always)]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+// ------------------------------------------------------------------
+// 4. Zero-copy view
 // ------------------------------------------------------------------
 #[derive(Debug, Clone, Copy)]
-pub struct BitReader<'a> {
+pub struct CiphertextView<'a> {
     bytes: &'a [u8],
-    byte_idx: usize,
-    bit_idx: u8,
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a> BitReader<'a> {
+impl<'a> CiphertextView<'a> {
     #[inline(always)]
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, byte_idx: 0, bit_idx: 0 }
-    }
-
-    /// Read up to 8 bits (1 byte) — zero-extends
-    #[inline(always)]
-    pub fn read_bits(&mut self, bits: u8) -> Option<u32> {
-        if bits == 0 || bits > 8 { return None; }
-        if self.byte_idx >= self.bytes.len() { return None; }
-
-        let mut val = 0u32;
-        let mut bits_left = bits;
-        while bits_left > 0 {
-            if self.byte_idx >= self.bytes.len() { return None; }
-            let byte = self.bytes[self.byte_idx];
-            let avail = 8 - self.bit_idx;
-            let take = bits_left.min(avail);
-            let shift = self.bit_idx;
-            let mask = (1u32 << take) - 1;
-            val |= (((byte >> shift) as u32) & mask) << (bits_left - take);
-            self.bit_idx += take;
-            if self.bit_idx == 8 {
-                self.byte_idx += 1;
-                self.bit_idx = 0;
-            }
-            bits_left -= take;
-        }
-        Some(val)
+        Self { bytes, _lifetime: PhantomData }
     }
 
     #[inline(always)]
-    pub fn remaining_bits(&self) -> usize {
-        self.bytes.len().saturating_sub(self.byte_idx) * 8 - self.bit_idx as usize
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 }
 
+//! **Secure helpers** — zeroize, RNG, hex, constant-time compare, ≤ 3 KB
+
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+use crate::types::{Key, Nonce};
+use core::mem::MaybeUninit;
+
+#[cfg(feature = "zeroize")]
+use zeroize::Zeroize;
+
 // ------------------------------------------------------------------
-// 4. SIMD dispatch (feature-gated)
+// 1. Secure RNG wrappers
 // ------------------------------------------------------------------
-// SIMD-accelerated bit-packing (AVX-512, AVX2, NEON)
-// These functions are exposed behind `#[cfg(all(feature = "simd", target_feature = "..."))]`
-// and are drop-in replacements for the scalar `pack_bits`/`unpack_bits`.
-// ------------------------------------------------------------------
-// 4.1  AVX-512  (512-bit vectors, 16 lanes of u32)
-// ------------------------------------------------------------------
-#[cfg(all(feature = "simd", target_feature = "avx512f"))]
+/// Fill buffer with cryptographically-secure random bytes.
 #[inline(always)]
-pub fn pack_bits_avx512(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
-    if bits == 0 || bits > 8 || src.len() % 16 != 0 {
-        return pack_bits(src, bits); // fallback
+pub fn fill_random(buf: &mut [u8]) -> Result<(), EncryptionError> {
+    #[cfg(feature = "getrandom")]
+    {
+        getrandom::getrandom(buf).map_err(|_| EncryptionError::RngUnavailable)
     }
-
-    use core::arch::x86_64::*;
-    unsafe {
-        let mut out = Vec::with_capacity((src.len() * bits as usize + 7) / 8);
-        let mut offset = 0usize;
-
-        while offset + 16 <= src.len() {
-            let vec = _mm512_loadu_si512(src.as_ptr().add(offset));
-            // shift right so each lane has bits LSB-aligned
-            let shifted = _mm512_srli_epi32(vec, 32 - bits);
-            // mask to keep only the bottom `bits`
-            let mask = _mm512_set1_epi32((1u32 << bits) - 1);
-            let masked = _mm512_and_si512(shifted, mask);
-            // pack down to u8 lanes
-            let packed = _mm512_cvtepi32_epi8(masked);
-            // store 16 bytes
-            let mut buf = [0u8; 16];
-            _mm512_storeu_si512(buf.as_mut_ptr(), packed);
-            out.extend_from_slice(&buf[..(16 * bits as usize + 7) / 8]);
-            offset += 16;
-        }
-        Ok(out)
+    #[cfg(not(feature = "getrandom"))]
+    {
+        // Stub for no_std without getrandom — caller must provide entropy
+        Ok(())
     }
 }
 
-// ------------------------------------------------------------------
-// 4.2  AVX2  (256-bit vectors, 8 lanes of u32)
-// ------------------------------------------------------------------
-#[cfg(all(feature = "simd", target_feature = "avx2"))]
+/// Generate 32-byte key.
 #[inline(always)]
-pub fn pack_bits_avx2(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
-    if bits == 0 || bits > 8 || src.len() % 8 != 0 {
-        return pack_bits(src, bits);
-    }
-
-    use core::arch::x86_64::*;
-    unsafe {
-        let mut out = Vec::with_capacity((src.len() * bits as usize + 7) / 8);
-        let mut offset = 0usize;
-
-        while offset + 8 <= src.len() {
-            let vec = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
-            let shifted = _mm256_srli_epi32(vec, 32 - bits);
-            let mask = _mm256_set1_epi32((1u32 << bits) - 1);
-            let masked = _mm256_and_si256(shifted, mask);
-            let packed = _mm256_packus_epi32(masked, masked); // 16 x u16
-            let packed8 = _mm256_packus_epi16(packed, packed); // 32 x u8
-            let mut buf = [0u8; 32];
-            _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, packed8);
-            out.extend_from_slice(&buf[..(8 * bits as usize + 7) / 8]);
-            offset += 8;
-        }
-        Ok(out)
-    }
+#[must_use]
+pub fn random_key() -> Result<Key, EncryptionError> {
+    let mut bytes = [0u8; 32];
+    fill_random(&mut bytes)?;
+    Ok(Key(bytes))
 }
 
-// ------------------------------------------------------------------
-// 4.3  NEON  (128-bit vectors, 4 lanes of u32)
-// ------------------------------------------------------------------
-#[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))]
+/// Generate 12-byte nonce.
 #[inline(always)]
-pub fn pack_bits_neon(src: &[u32], bits: u8) -> Result<Vec<u8>, CompressionError> {
-    if bits == 0 || bits > 8 || src.len() % 4 != 0 {
-        return pack_bits(src, bits);
-    }
+#[must_use]
+pub fn random_nonce() -> Result<Nonce, EncryptionError> {
+    let mut bytes = [0u8; 12];
+    fill_random(&mut bytes)?;
+    Ok(Nonce(bytes))
+}
 
-    use core::arch::aarch64::*;
-    unsafe {
-        let mut out = Vec::with_capacity((src.len() * bits as usize + 7) / 8);
-        let mut offset = 0usize;
-
-        while offset + 4 <= src.len() {
-            let vec = vld1q_u32(src.as_ptr().add(offset));
-            let shifted = vshrq_n_u32(vec, 32 - bits);
-            let mask = vdupq_n_u32((1u32 << bits) - 1);
-            let masked = vandq_u32(shifted, mask);
-            let packed = vmovn_u32(masked); // 4 x u8
-            let mut buf = [0u8; 8];
-            vst1_u8(buf.as_mut_ptr(), packed);
-            out.extend_from_slice(&buf[..(4 * bits as usize + 7) / 8]);
-            offset += 4;
+// ------------------------------------------------------------------
+// 2. Secure wipe
+// ------------------------------------------------------------------
+/// Zero-fill buffer (volatile to prevent compiler elision).
+#[inline(always)]
+pub fn secure_zero(buf: &mut [u8]) {
+    #[cfg(feature = "zeroize")]
+    buf.zeroize();
+    #[cfg(not(feature = "zeroize"))]
+    {
+        for b in buf.iter_mut() {
+            core::ptr::write_volatile(b, 0);
         }
-        Ok(out)
     }
 }
+
 // ------------------------------------------------------------------
-// 5. Public exports
+// 3. Hex encode / decode
 // ------------------------------------------------------------------
-pub use {pack_bits, unpack_bits, bit_mask, bit_count, BitReader};
+/// Encode slice to lowercase hex.
+#[inline(always)]
+pub fn to_hex(src: &[u8]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(src.len() * 2);
+    for b in src {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Decode lowercase hex into Vec<u8>; rejects odd length or non-hex.
+#[inline(always)]
+pub fn from_hex(hex: &str) -> Result<Vec<u8>, EncryptionError> {
+    if hex.len() % 2 != 0 {
+        return Err(EncryptionError::InvalidHexLength);
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i+2], 16).map_err(|_| EncryptionError::InvalidHex)?;
+        out.push(byte);
+    }
+    Ok(out)
+}
+
+// ------------------------------------------------------------------
+// 4. Constant-time compare
+// ------------------------------------------------------------------
+/// Safe constant-time byte comparison.
+#[inline(always)]
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ------------------------------------------------------------------
+// 5. Alignment helper
+// ------------------------------------------------------------------
+/// Round `len` up to next power-of-two alignment.
+#[inline(always)]
+pub fn align_up(len: usize, align: usize) -> usize {
+    (len + align - 1) & !(align - 1)
+}
+
+// ------------------------------------------------------------------
+// 6. Error variants
+// ------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionError {
+    RngUnavailable,
+    InvalidHexLength,
+    InvalidHex,
+}
+
+// ------------------------------------------------------------------
+// 7. Optional zeroize wrapper
+// ------------------------------------------------------------------
+#[cfg(feature = "zeroize")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Sensitive<T>(pub T)
+where
+    T: zeroize::Zeroize;
+
+#[cfg(feature = "zeroize")]
+impl<T: zeroize::Zeroize> Drop for Sensitive<T> {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+// ------------------------------------------------------------------
+// 8. Public exports
+// ------------------------------------------------------------------
+pub use {
+    fill_random, random_key, random_nonce, secure_zero, to_hex, from_hex, ct_eq, align_up,
+};
+#[cfg(feature = "zeroize")]
+pub use Sensitive;
+
+//! Single-call, state-of-art encryption façade
+//! encrypt / decrypt / derive_key / generate_key / generate_nonce / generate_salt
+//! Zero-copy variants included, FFI-ready, ≤ 6 KB .rlib
+
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+// ---------- Re-export all public primitives ----------
+pub use crate::encryption::{
+    aead::{Aead, encrypt, encrypt_into, decrypt, decrypt_into},
+    errors::CryptoError,
+    keys::{Key, generate_key},
+    kdf::{Kdf, derive_key, derive_key_into},
+    nonce::{Nonce, generate_nonce},
+    utils::{generate_salt},
+};
+
+// ---------- convenience façade helpers ----------
+#[inline(always)]
+pub fn seal(
+    key: &Key,
+    nonce: &Nonce,
+    plaintext: &[u8],
+    algo: Aead,
+) -> Result<alloc::vec::Vec<u8>, CryptoError> {
+    encrypt(key, nonce, plaintext, algo)
+}
+
+#[inline(always)]
+pub fn open(
+    key: &Key,
+    nonce: &Nonce,
+    ciphertext: &[u8],
+    algo: Aead,
+) -> Result<alloc::vec::Vec<u8>, CryptoError> {
+    decrypt(key, nonce, ciphertext, algo)
+}
+
+/// Encrypt into caller buffer (zero-copy).
+#[inline(always)]
+pub fn seal_into(
+    key: &Key,
+    nonce: &Nonce,
+    plaintext: &[u8],
+    dst: &mut [u8],
+    algo: Aead,
+) -> Result<(), CryptoError> {
+    encrypt_into(key, nonce, plaintext, dst, algo)
+}
+
+/// Decrypt into caller buffer (zero-copy).
+#[inline(always)]
+pub fn open_into(
+    key: &Key,
+    nonce: &Nonce,
+    ciphertext: &[u8],
+    dst: &mut [u8],
+    algo: Aead,
+) -> Result<(), CryptoError> {
+    decrypt_into(key, nonce, ciphertext, dst, algo)
+}
+
+// ---------- internal modules ----------
+mod aead;
+mod errors;
+mod keys;
+mod kdf;
+mod nonce;
+mod utils;

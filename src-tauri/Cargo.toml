@@ -52,10 +52,12 @@ rayon = "1.8"
 argon2 = "0.5"
 blake3 = "1.5"
 base64 = "0.22"
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [features]
 default = ["custom-protocol", "parallel", "mobile-optimized"]
-parallel = ["rayon"]
+parallel = []
 custom-protocol = ["tauri/custom-protocol"]
 cuda = ["cc/parallel"]
 metal = []
@@ -64,6 +66,8 @@ mobile-optimized = []
 low-power = []
 ios = []
 android = []
+ffi = []
+serde = []
 
 [dev-dependencies]
 tempfile = "^3.0"
