@@ -1,3 +1,4 @@
+guivernoir@guivernoir-Latitude-E6410:~/Desktop/Athena/src-tauri/src$ tree
 .
 ├── Architecture.md
 ├── cache
@@ -10,6 +11,30 @@
 │   ├── score.rs
 │   └── tests.rs
 ├── commands.rs
+├── disk
+│   ├── Architecture.md
+│   ├── benches
+│   │   └── bench_query.rs
+│   ├── cleanup.rs
+│   ├── config.rs
+│   ├── ffi.rs
+│   ├── index
+│   │   ├── flat.rs
+│   │   ├── ivf.rs
+│   │   ├── mod.rs
+│   │   └── pq.rs
+│   ├── mod.rs
+│   ├── query.rs
+│   ├── storage
+│   │   ├── file_format.rs
+│   │   ├── inmem.rs
+│   │   ├── mmap.rs
+│   │   └── mod.rs
+│   ├── tests
+│   │   ├── insert_query.rs
+│   │   ├── load_bootstrap.rs
+│   │   └── mod.rs
+│   └── types.rs
 ├── embedding
 │   ├── engine.cpp
 │   ├── engine.hpp
@@ -59,16 +84,6 @@
 │   │   └── qwen2.5-0.5b-instruct-q5_k_m.gguf
 │   └── mod.rs
 ├── main.rs
-├── memory
-│   ├── Architecture.md
-│   ├── index.rs
-│   ├── io.rs
-│   ├── layout.rs
-│   ├── mod.rs
-│   ├── record.rs
-│   ├── search.rs
-│   ├── store.rs
-│   └── tests.rs
 ├── personalities
 │   ├── Aurora.toml
 │   ├── Ekaterina.toml
@@ -95,6 +110,7 @@
 │   ├── router.rs
 │   └── tokenizer.rs
 ├── security
+│   ├── Architecture.md
 │   ├── compression
 │   │   ├── Architecture.md
 │   │   ├── bitpacking
@@ -145,8 +161,16 @@
 │   ├── Architecture.md
 │   ├── cpp
 │   │   ├── CMakeLists.txt
-│   │   ├── faiss_wrapper.cpp
-│   │   └── faiss_wrapper.hpp
+│   │   ├── include
+│   │   │   └── faiss_wrapper.h
+│   │   ├── README.md
+│   │   ├── src
+│   │   │   ├── platform.cpp
+│   │   │   ├── wrapper.cpp
+│   │   │   └── wrapper.h
+│   │   └── tests
+│   │   ├── CMakeLists.txt
+│   │   └── smoke.cpp
 │   ├── decoder.rs
 │   ├── encoder.rs
 │   ├── ffi.rs
@@ -154,9 +178,14 @@
 │   ├── preprocessor.rs
 │   ├── tests
 │   │   ├── mod.rs
-│   │   ├── test_encoding.rs
-│   │   ├── test_faiss_integration.rs
-│   │   └── test_training.rs
+│   │   ├── test_decoder.rs
+│   │   ├── test_encoder.rs
+│   │   ├── test_integration.rs
+│   │   ├── test_preprocessor.rs
+│   │   ├── test_trainer.rs
+│   │   └── test_types.rs
 │   ├── trainer.rs
 │   ├── types.rs
 │   └── wrapper.rs
+├── test2.txt
+└── test.txt
